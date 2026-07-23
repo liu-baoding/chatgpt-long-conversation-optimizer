@@ -9,6 +9,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
@@ -1043,12 +1044,749 @@
     );
   }
 
+  // ============================================================
+  // 公式复制修复
+  //
+  // 将官方复制结果中的：
+  //   (a>0)       -> $a>0$
+  //   [ ... ]     -> $$ ... $$
+  //
+  // 公式源码取自 KaTeX annotation，而不是猜测普通括号。
+  // ============================================================
+
+  const FORMULA_COPY_FIX = {
+    contextTtl: 4000,
+    prototypeMarker: '__cgpt_formula_copy_fix_installed__',
+  };
+
+  let pendingFormulaCopy = null;
+  let formulaCopyListenersInstalled = false;
+
+  function escapeRegExp(value) {
+    return String(value).replace(
+      /[.*+?^${}()|[\]\\]/g,
+      '\\$&',
+    );
+  }
+
+  /*
+   * 创建允许空白变化的匹配模式。
+   */
+  function makeLooseTextPattern(value) {
+    const text =
+      String(value || '').trim();
+
+    if (!text) {
+      return null;
+    }
+
+    return text
+      .split(/\s+/)
+      .map(escapeRegExp)
+      .join(String.raw`\s*`);
+  }
+
+  function normalizeMathVisibleText(value) {
+    return String(value || '')
+      .replace(/\u200b/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /*
+   * 按 DOM 顺序收集公式。
+   *
+   * 注意：
+   * 这里不能再按公式长度排序，
+   * 因为行间公式需要按照出现顺序替换。
+   */
+  function collectMathFormulas(message) {
+    const formulas = [];
+
+    message
+      .querySelectorAll(
+        'annotation[encoding="application/x-tex"]',
+      )
+      .forEach((annotation) => {
+        const tex = (
+          annotation.textContent || ''
+        ).trim();
+
+        if (!tex) {
+          return;
+        }
+
+        const katex =
+          annotation.closest('.katex');
+
+        const visibleText =
+          normalizeMathVisibleText(
+            katex
+              ?.querySelector('.katex-html')
+              ?.textContent,
+          );
+
+        formulas.push({
+          tex,
+          visibleText,
+
+          display: Boolean(
+            annotation.closest(
+              '.katex-display',
+            ),
+          ),
+        });
+      });
+
+    return formulas;
+  }
+
+  /*
+   * 从原始 TeX 生成若干可能出现在官方复制结果中的形式。
+   *
+   * 主要用于行内公式和异常情况下的回退匹配。
+   */
+  function getFormulaTextCandidates(
+    formula,
+  ) {
+    const candidates = new Set();
+
+    const tex =
+      formula.tex.trim();
+
+    if (tex) {
+      candidates.add(tex);
+
+      /*
+       * 官方复制可能删除部分转义和间距命令。
+       */
+      const simplified = tex
+        .replace(/\\%/g, '%')
+        .replace(
+          /\\(?:,|;|:|!|quad|qquad)\b/g,
+          ' ',
+        )
+        .replace(
+          /\\text\{([^{}]*)\}/g,
+          '$1',
+        )
+        .replace(
+          /\\operatorname\{([^{}]*)\}/g,
+          '$1',
+        )
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (simplified) {
+        candidates.add(simplified);
+      }
+    }
+
+    if (formula.visibleText) {
+      candidates.add(
+        formula.visibleText,
+      );
+    }
+
+    return [...candidates]
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          b.length - a.length,
+      );
+  }
+
+  /*
+   * 暂时保护 fenced code block，防止代码中的：
+   *
+   * [
+   * ...
+   * ]
+   *
+   * 被误判为数学公式。
+   */
+  function protectFencedCodeBlocks(text) {
+    const blocks = [];
+
+    const masked = text.replace(
+      /```[\s\S]*?```|~~~[\s\S]*?~~~/g,
+      (block) => {
+        const index =
+          blocks.push(block) - 1;
+
+        return (
+          `\uE000CGPT_CODE_${index}\uE001`
+        );
+      },
+    );
+
+    return {
+      masked,
+
+      restore(value) {
+        return value.replace(
+          /\uE000CGPT_CODE_(\d+)\uE001/g,
+          (_, index) =>
+            blocks[Number(index)] || '',
+        );
+      },
+    };
+  }
+
+  /*
+   * 找到官方复制产生的独立行间公式块：
+   *
+   * [
+   * ...
+   * ]
+   */
+  function findDisplayPlaceholders(
+    text,
+  ) {
+    const pattern =
+      /(^|\n)([ \t]*)\[[ \t]*\n([\s\S]*?)\n[ \t]*\](?=\n|$)/g;
+
+    return [
+      ...text.matchAll(pattern),
+    ];
+  }
+
+  /*
+   * 如果占位块数量与 DOM 中的行间公式数量一致，
+   * 按出现顺序直接替换。
+   *
+   * 不关心复制文本中的公式正文是否已被改坏。
+   */
+  function replaceDisplayByOrder(
+    text,
+    displayFormulas,
+  ) {
+    const matches =
+      findDisplayPlaceholders(text);
+
+    if (
+      matches.length === 0 ||
+      matches.length !==
+        displayFormulas.length
+    ) {
+      return {
+        text,
+        replaced: false,
+      };
+    }
+
+    let output = '';
+    let cursor = 0;
+
+    matches.forEach(
+      (match, index) => {
+        output += text.slice(
+          cursor,
+          match.index,
+        );
+
+        const prefix =
+          match[1] || '';
+
+        const indent =
+          match[2] || '';
+
+        const tex =
+          displayFormulas[
+            index
+          ].tex.trim();
+
+        output +=
+          `${prefix}${indent}$$\n` +
+          `${tex}\n` +
+          `${indent}$$`;
+
+        cursor =
+          match.index +
+          match[0].length;
+      },
+    );
+
+    output += text.slice(cursor);
+
+    return {
+      text: output,
+      replaced: true,
+    };
+  }
+
+  /*
+   * 行间公式的正文匹配回退。
+   *
+   * 仅当占位块数量与公式数量不一致时使用。
+   */
+  function replaceOneDisplayFormula(
+    text,
+    formula,
+  ) {
+    const tex =
+      formula.tex.trim();
+
+    for (
+      const candidate
+      of getFormulaTextCandidates(
+        formula,
+      )
+    ) {
+      const body =
+        makeLooseTextPattern(
+          candidate,
+        );
+
+      if (!body) {
+        continue;
+      }
+
+      const pattern =
+        new RegExp(
+          String.raw`(^|\n)[ \t]*(?:\\\[|\[)[ \t]*\n?\s*${body}\s*\n?[ \t]*(?:\\\]|\])(?=\n|$)`,
+          'm',
+        );
+
+      if (pattern.test(text)) {
+        return text.replace(
+          pattern,
+
+          (_, prefix) =>
+            `${prefix}$$\n${tex}\n$$`,
+        );
+      }
+    }
+
+    return text;
+  }
+
+  /*
+   * 行内公式仍然通过内容匹配。
+   *
+   * 同时尝试：
+   * - 原始 TeX；
+   * - 简化后的 TeX；
+   * - KaTeX 可见文本。
+   */
+  function replaceOneInlineFormula(
+    text,
+    formula,
+  ) {
+    const tex =
+      formula.tex.trim();
+
+    for (
+      const candidate
+      of getFormulaTextCandidates(
+        formula,
+      )
+    ) {
+      const body =
+        makeLooseTextPattern(
+          candidate,
+        );
+
+      if (!body) {
+        continue;
+      }
+
+      /*
+       * 匹配：
+       * \(formula\)
+       * 或：
+       * (formula)
+       */
+      const pattern =
+        new RegExp(
+          String.raw`(?:\\\(|\()\s*${body}\s*(?:\\\)|\))`,
+        );
+
+      if (pattern.test(text)) {
+        return text.replace(
+          pattern,
+          `$${tex}$`,
+        );
+      }
+    }
+
+    return text;
+  }
+
+  function rememberFormulaCopyTarget(event) {
+    const target = event.target;
+
+    if (!(target instanceof Element)) {
+      return;
+    }
+
+    const button = target.closest(
+      'button[data-testid="copy-turn-action-button"]',
+    );
+
+    if (!button) {
+      return;
+    }
+
+    const turn = button.closest(
+      'section[data-turn="assistant"]',
+    );
+
+    const message = turn?.querySelector(
+      '[data-message-author-role="assistant"]',
+    );
+
+    if (!message) {
+      pendingFormulaCopy = null;
+      return;
+    }
+
+    pendingFormulaCopy = {
+      expiresAt:
+        Date.now() +
+        FORMULA_COPY_FIX.contextTtl,
+
+      formulas:
+        collectMathFormulas(message),
+    };
+  }
+
+  function getFormulaCopyContext() {
+    if (!pendingFormulaCopy) {
+      return null;
+    }
+
+    if (
+      Date.now() >
+      pendingFormulaCopy.expiresAt
+    ) {
+      pendingFormulaCopy = null;
+      return null;
+    }
+
+    return pendingFormulaCopy;
+  }
+
+  function repairCopiedMath(
+    text,
+    formulas,
+  ) {
+    let result = String(text)
+      .replace(/\r\n?/g, '\n');
+
+    if (!formulas?.length) {
+      return result;
+    }
+
+    const protectedText =
+      protectFencedCodeBlocks(
+        result,
+      );
+
+    result =
+      protectedText.masked;
+
+    const displayFormulas =
+      formulas.filter(
+        (formula) =>
+          formula.display,
+      );
+
+    const inlineFormulas =
+      formulas.filter(
+        (formula) =>
+          !formula.display,
+      );
+
+    /*
+     * 优先按顺序修复所有行间公式。
+     */
+    const displayResult =
+      replaceDisplayByOrder(
+        result,
+        displayFormulas,
+      );
+
+    result =
+      displayResult.text;
+
+    /*
+     * 如果数量不一致，才退回正文匹配。
+     */
+    if (
+      !displayResult.replaced
+    ) {
+      for (
+        const formula
+        of displayFormulas
+      ) {
+        result =
+          replaceOneDisplayFormula(
+            result,
+            formula,
+          );
+      }
+    }
+
+    /*
+     * 修复行内公式。
+     */
+    for (
+      const formula
+      of inlineFormulas
+    ) {
+      result =
+        replaceOneInlineFormula(
+          result,
+          formula,
+        );
+    }
+
+    return protectedText.restore(
+      result,
+    );
+  }
+
+  function installClipboardPrototypePatch() {
+    /*
+     * Tampermonkey 默认运行在隔离环境中。
+     * 必须通过 unsafeWindow 修改网页主环境中的
+     * Clipboard.prototype，否则官方按钮不会经过补丁。
+     */
+    const pageWindow =
+      typeof unsafeWindow !== 'undefined'
+        ? unsafeWindow
+        : window;
+
+    const clipboard =
+      pageWindow.navigator?.clipboard;
+
+    if (!clipboard) {
+      console.warn(
+        '[ChatGPT 优化] Clipboard API 不可用，公式复制修复未安装。',
+      );
+
+      return;
+    }
+
+    const prototype =
+      Object.getPrototypeOf(clipboard);
+
+    if (
+      !prototype ||
+      prototype[
+        FORMULA_COPY_FIX.prototypeMarker
+      ]
+    ) {
+      return;
+    }
+
+    const originalWriteText =
+      prototype.writeText;
+
+    const originalWrite =
+      prototype.write;
+
+    /*
+     * 处理 navigator.clipboard.writeText(...)
+     */
+    if (
+      typeof originalWriteText ===
+      'function'
+    ) {
+      Object.defineProperty(
+        prototype,
+        'writeText',
+        {
+          configurable: true,
+          writable: true,
+
+          value: function patchedWriteText(
+            text,
+          ) {
+            const context =
+              getFormulaCopyContext();
+
+            const fixedText = context
+              ? repairCopiedMath(
+                  text,
+                  context.formulas,
+                )
+              : text;
+
+            return originalWriteText.call(
+              this,
+              fixedText,
+            );
+          },
+        },
+      );
+    }
+
+    /*
+     * 兼容 navigator.clipboard.write(...)
+     * 仅修改 text/plain，不改变 text/html 等格式。
+     */
+    if (
+      typeof originalWrite === 'function' &&
+      typeof pageWindow.ClipboardItem ===
+        'function'
+    ) {
+      Object.defineProperty(
+        prototype,
+        'write',
+        {
+          configurable: true,
+          writable: true,
+
+          value: function patchedWrite(
+            items,
+          ) {
+            const context =
+              getFormulaCopyContext();
+
+            if (!context) {
+              return originalWrite.call(
+                this,
+                items,
+              );
+            }
+
+            try {
+              const sourceItems =
+                Array.from(items);
+
+              const hasPlainText =
+                sourceItems.some(
+                  (item) =>
+                    Array.from(
+                      item.types || [],
+                    ).includes(
+                      'text/plain',
+                    ),
+                );
+
+              if (!hasPlainText) {
+                return originalWrite.call(
+                  this,
+                  items,
+                );
+              }
+
+              const patchedItems =
+                sourceItems.map((item) => {
+                  const data = {};
+
+                  for (
+                    const type of
+                    item.types || []
+                  ) {
+                    if (
+                      type === 'text/plain'
+                    ) {
+                      data[type] =
+                        item
+                          .getType(type)
+                          .then(
+                            (blob) =>
+                              blob.text(),
+                          )
+                          .then(
+                            (plainText) =>
+                              new pageWindow.Blob(
+                                [
+                                  repairCopiedMath(
+                                    plainText,
+                                    context.formulas,
+                                  ),
+                                ],
+                                {
+                                  type:
+                                    'text/plain',
+                                },
+                              ),
+                          );
+                    } else {
+                      data[type] =
+                        item.getType(type);
+                    }
+                  }
+
+                  return new pageWindow
+                    .ClipboardItem(data);
+                });
+
+              return originalWrite.call(
+                this,
+                patchedItems,
+              );
+            } catch (error) {
+              console.warn(
+                '[ChatGPT 优化] ClipboardItem 修复失败，回退到原始复制。',
+                error,
+              );
+
+              return originalWrite.call(
+                this,
+                items,
+              );
+            }
+          },
+        },
+      );
+    }
+
+    Object.defineProperty(
+      prototype,
+      FORMULA_COPY_FIX.prototypeMarker,
+      {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: true,
+      },
+    );
+
+    console.info(
+      '[ChatGPT 优化] 数学公式复制修复已安装。',
+    );
+  }
+
+  function installFormulaCopyFix() {
+    if (
+      !formulaCopyListenersInstalled
+    ) {
+      /*
+       * pointerdown 比官方 click 处理更早，
+       * 确保写入剪贴板前已经取得本条回复公式。
+       */
+      document.addEventListener(
+        'pointerdown',
+        rememberFormulaCopyTarget,
+        true,
+      );
+
+      document.addEventListener(
+        'click',
+        rememberFormulaCopyTarget,
+        true,
+      );
+
+      formulaCopyListenersInstalled =
+        true;
+    }
+
+    installClipboardPrototypePatch();
+  }
+
   function init() {
     injectStyle();
     applyConfig();
 
     scanTables(document);
     startTableObserver();
+
+    installFormulaCopyFix();
 
     registerMenu();
 
