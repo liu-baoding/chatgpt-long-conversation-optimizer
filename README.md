@@ -47,4 +47,4 @@
 
 ## 许可证
 
-本项目采用 MIT License 许可。
+本项目采用 [MIT License](https://opensource.org/license/mit) 许可。
