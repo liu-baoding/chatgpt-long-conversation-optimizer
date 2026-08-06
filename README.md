@@ -44,3 +44,7 @@
 
 - `https://chatgpt.com/*`
 - `https://chat.openai.com/*`
+
+## 许可证
+
+本项目采用 MIT License 许可。
