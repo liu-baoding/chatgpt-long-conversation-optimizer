@@ -263,7 +263,38 @@
             );
         };
 
-        tryHook();
+        if (!tryHook()) {
+            try {
+                const descriptor =
+                    Object.getOwnPropertyDescriptor(
+                        window,
+                        'katex'
+                    );
+
+                if (!descriptor || descriptor.configurable) {
+                    let currentKatex = window.katex;
+
+                    Object.defineProperty(
+                        window,
+                        'katex',
+                        {
+                            configurable: true,
+                            get() {
+                                return currentKatex;
+                            },
+                            set(value) {
+                                currentKatex = value;
+                                if (!geminiHookInstalled) {
+                                    hookGeminiKatexRender(value);
+                                }
+                            }
+                        }
+                    );
+                }
+            } catch (_) {
+                // Fall back to polling when the property cannot be wrapped.
+            }
+        }
 
         let attempts = 0;
         geminiHookTimer = window.setInterval(() => {
@@ -274,7 +305,6 @@
             }
         }, 250);
     }
-
     function geminiFormulaInfo(node) {
         const element = elementFromNode(node);
         if (!element) return null;
