@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 用量监视器
 // @namespace    https://tampermonkey.net/
-// @version      1.0.1
-// @description  在 ChatGPT 页面内直接读取当前登录会话并显示 5 小时/周限额、重置额度和使用状态，无需手工维护 Bearer Token
+// @version      1.1.0
+// @description  在 ChatGPT 页面内显示用量、重置额度和订阅周期信息，无需手工维护 Bearer Token
 // @author       Liu Baoding
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -22,6 +22,7 @@
     const SESSION_URL = '/api/auth/session';
     const USAGE_URL = '/backend-api/wham/usage';
     const RESET_CREDITS_URL = '/backend-api/wham/rate-limit-reset-credits';
+    const ACCOUNTS_CHECK_URL = '/backend-api/accounts/check/v4-2023-04-27';
 
     const ROOT_ID = 'chatgpt-usage-monitor-root';
     const STYLE_ID = 'chatgpt-usage-monitor-style';
@@ -74,6 +75,66 @@
         const date = new Date(value);
         if (Number.isNaN(date.getTime())) return '—';
         return date.toLocaleString('zh-CN', { hour12: false });
+    }
+
+    function formatDateOnly(value) {
+        if (!value) return '—';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return '—';
+        return date.toLocaleDateString('zh-CN', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+        });
+    }
+
+    function getCurrentAccountInfo(accountsCheck, accountId) {
+        const accounts = accountsCheck?.accounts;
+        if (!accounts || typeof accounts !== 'object') return null;
+
+        const entry =
+            (accountId && accounts[accountId]) ||
+            accounts.default ||
+            Object.values(accounts).find(value => value && typeof value === 'object');
+
+        if (!entry) return null;
+
+        const account = entry.account || {};
+        const entitlement = entry.entitlement || {};
+        const lastSubscription = entry.last_active_subscription || {};
+
+        const willRenew = lastSubscription.will_renew === true;
+        const active = entitlement.has_active_subscription === true;
+
+        /*
+         * ChatGPT 网页当前会把 renews_at 作为自动续费账户的
+         * 当前订阅周期节点展示。若不会续费，则优先显示取消/失效时间。
+         */
+        const periodDate = willRenew
+            ? entitlement.renews_at
+            : (
+                entitlement.cancels_at ||
+                entitlement.expires_at ||
+                entitlement.renews_at
+            );
+
+        return {
+            plan:
+                account.plan_display_name ||
+                account.plan_type ||
+                entitlement.subscription_plan ||
+                '',
+            active,
+            willRenew,
+            periodDate,
+            periodLabel: willRenew ? '下次续费' : '订阅有效至',
+            expiresAt: entitlement.expires_at || '',
+            renewsAt: entitlement.renews_at || '',
+            cancelsAt: entitlement.cancels_at || '',
+            billingCurrency: entitlement.billing_currency || '',
+            purchasePlatform: lastSubscription.purchase_origin_platform || '',
+            delinquent: entitlement.is_delinquent === true,
+        };
     }
 
     function formatPlan(plan) {
@@ -187,9 +248,10 @@
     async function queryUsage() {
         const auth = await readSession();
 
-        const [usageResult, resetResult] = await Promise.allSettled([
+        const [usageResult, resetResult, accountsResult] = await Promise.allSettled([
             fetchJson(USAGE_URL, auth),
             fetchJson(RESET_CREDITS_URL, auth),
+            fetchJson(ACCOUNTS_CHECK_URL, auth),
         ]);
 
         if (usageResult.status === 'rejected') {
@@ -206,6 +268,15 @@
                 resetResult.status === 'rejected'
                     ? String(resetResult.reason?.message || resetResult.reason || '请求失败')
                     : '',
+            accountsCheck:
+                accountsResult.status === 'fulfilled'
+                    ? accountsResult.value
+                    : null,
+            accountsCheckError:
+                accountsResult.status === 'rejected'
+                    ? String(accountsResult.reason?.message || accountsResult.reason || '请求失败')
+                    : '',
+            accountId: auth.accountId,
         };
     }
 
@@ -692,9 +763,23 @@
 
         const status = root.querySelector('#cum-status');
         status.className = 'cum-status';
+
+        const partialErrors = [];
+        if (data.resetCreditsError) {
+            partialErrors.push(`重置额度：${data.resetCreditsError}`);
+        }
+        if (data.accountsCheckError) {
+            partialErrors.push(`订阅信息：${data.accountsCheckError}`);
+        }
+
         status.textContent =
             `更新于 ${new Date().toLocaleString('zh-CN', { hour12: false })}` +
-            (data.resetCreditsError ? `；重置额度详情：${data.resetCreditsError}` : '');
+            (partialErrors.length ? `；${partialErrors.join('；')}` : '');
+
+        const subscription = getCurrentAccountInfo(
+            data.accountsCheck,
+            data.accountId
+        );
 
         const details = [];
         const credits = usage.credits;
@@ -742,6 +827,41 @@
         }
 
         let detailHtml = '';
+
+        if (subscription) {
+            const subscriptionStatus = subscription.active
+                ? (subscription.delinquent ? '有效（账单异常）' : '有效')
+                : '未激活';
+
+            detailHtml += `
+                <section class="cum-section">
+                    <div class="cum-section-title">订阅信息</div>
+                    <div class="cum-detail-row">
+                        <span>套餐</span>
+                        <span>${escapeHtml(subscription.plan || '—')}</span>
+                    </div>
+                    <div class="cum-detail-row">
+                        <span>订阅状态</span>
+                        <span>${escapeHtml(subscriptionStatus)}</span>
+                    </div>
+                    <div class="cum-detail-row">
+                        <span>${escapeHtml(subscription.periodLabel)}</span>
+                        <span>${escapeHtml(formatDateOnly(subscription.periodDate))}</span>
+                    </div>
+                    <div class="cum-detail-row">
+                        <span>自动续费</span>
+                        <span>${subscription.willRenew ? '是' : '否'}</span>
+                    </div>
+                    ${subscription.purchasePlatform ? `
+                        <div class="cum-detail-row">
+                            <span>购买平台</span>
+                            <span>${escapeHtml(subscription.purchasePlatform)}</span>
+                        </div>
+                    ` : ''}
+                </section>
+            `;
+        }
+
         if (details.length) {
             detailHtml += `
                 <section class="cum-section">
@@ -789,6 +909,7 @@
         root.querySelector('#cum-raw').textContent = JSON.stringify({
             usage: data.usage,
             rate_limit_reset_credits: data.resetCredits,
+            accounts_check: data.accountsCheck,
         }, null, 2);
     }
 
