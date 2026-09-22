@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.0.2
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站提供公式悬浮预览、单公式复制、选择复制和复制按钮修复
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -425,7 +425,7 @@
                         ) ||
                         carrier
                 }),
-            replyCopyMode: 'normalize'
+            replyCopyMode: 'deepseek'
         },
         {
             id: 'gemini',
@@ -736,6 +736,40 @@
 
         return oldTurn;
     }
+    function getDeepSeekReplyRoot(button) {
+        if (!button) return null;
+
+        const item =
+            button.closest(
+                '[data-virtual-list-item-key]'
+            );
+
+        if (item) {
+            const reply =
+                item.querySelector(
+                    '.ds-assistant-message-main-content'
+                );
+
+            if (reply) {
+                return reply;
+            }
+        }
+
+        const actionRow =
+            button.closest('.ds-flex');
+
+        const parent =
+            actionRow &&
+            actionRow.parentElement;
+
+        return (
+            parent &&
+            parent.querySelector(
+                '.ds-assistant-message-main-content'
+            )
+        ) || null;
+    }
+
 
     function isReplyCopyButton(button) {
         if (!button) return false;
@@ -826,15 +860,27 @@
             }
 
             /*
-             * DeepSeek 当前网页的消息操作项通常不是 <button>，
-             * 而是 .ds-icon-button。复制图标使用 20x20 SVG。
-             * 这里用复制图标 path 作为最后一道识别，而不是把
-             * 所有 .ds-icon-button 都当成复制按钮。
+             * 2026-09 DeepSeek 当前回复操作栏：
+             *   <div role="button" class="ds-button ...">
+             *     <svg width="16" height="16" viewBox="0 0 16 16">
+             *       <path d="M6.14929 4.02032 ...">
+             *
+             * 该复制图标没有 aria-label / title / data-testid，
+             * 因此使用 SVG path 前缀作为稳定的最后回退。
              */
-            const copyIconPath = button.querySelector(
-                'svg[viewBox="0 0 20 20"] ' +
-                'path[d^="M5 14H4V5h9v1"]'
-            );
+            const copyIconPath = Array.from(
+                button.querySelectorAll(
+                    'svg[viewBox="0 0 16 16"] path[d]'
+                )
+            ).find(path => {
+                const d =
+                    path.getAttribute('d') ||
+                    '';
+
+                return d.startsWith(
+                    'M6.14929 4.02032'
+                );
+            });
 
             return Boolean(copyIconPath);
         }
@@ -1324,6 +1370,41 @@
                     repairCopiedReply(
                         originalText,
                         formulas
+                    );
+            } else if (
+                ACTIVE_ADAPTER.replyCopyMode ===
+                'deepseek'
+            ) {
+                const replyRoot =
+                    getDeepSeekReplyRoot(
+                        button
+                    );
+
+                const formulas =
+                    collectFormulas(
+                        replyRoot
+                    );
+
+                formulaCount =
+                    formulas.length;
+
+                /*
+                 * DeepSeek 的正文 DOM 中保留完整 application/x-tex，
+                 * 因此优先按已知公式顺序修复原生复制结果。
+                 * 如果当前复制结果只需要定界符规范化，再执行一次
+                 * 轻量 normalize 作为回退。
+                 */
+                repairedText =
+                    formulaCount
+                        ? repairCopiedReply(
+                            originalText,
+                            formulas
+                        )
+                        : originalText;
+
+                repairedText =
+                    normalizeCopiedDelimiters(
+                        repairedText
                     );
             } else if (
                 ACTIVE_ADAPTER.replyCopyMode ===
