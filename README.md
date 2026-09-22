@@ -70,11 +70,14 @@ https://chat.openai.com/*
 - 直接查询：
   - `/backend-api/wham/usage`
   - `/backend-api/wham/rate-limit-reset-credits`
+  - `/backend-api/accounts/check/v4-2023-04-27`
 - 显示：
   - 5 小时限额及重置倒计时
   - 周限额及重置倒计时
   - 重置额度及明细
   - 当前使用状态
+  - 当前订阅套餐与状态
+  - 自动续费状态及当前订阅周期节点
   - 积分余额、消费控制等辅助信息
   - 原始 JSON
 - Token 只保存在当前页面 JS 内存中，不写入：
