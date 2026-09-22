@@ -87,12 +87,14 @@ https://chat.openai.com/*
   - 本地文件
 - 若请求返回 401/403，会重新读取当前登录会话并自动重试一次。
 - 页面右侧输入区外侧使用两个竖排圆环显示 5 小时 / 周限额剩余比例，避免横向胶囊遮挡输入框。
+- 详情面板改为视口垂直居中，并限制最大高度，避免顶部超出页面。
 - 点击圆环后展开详情面板。
 - 页面刷新后会自动获取一次用量，使圆环直接显示当前状态。
 - 页面保持打开时约每 5 分钟后台刷新一次；从后台切回且数据已过期时也会自动刷新。
-- 被动监听 ChatGPT 自身的 Sentinel `chat-requirements` / `prepare` 响应，提取 `proofofwork.difficulty`；不会为了检测而主动重复发送 Sentinel prepare 请求。
+- 从 `document-start` 开始被动监听 ChatGPT 自身的 Sentinel `chat-requirements` / `prepare` 响应，提取 `proofofwork.difficulty`；不会为了检测而主动重复发送 Sentinel prepare 请求。
 - PoW 仅在当前标签页 `sessionStorage` 保存 `difficulty`、`persona` 和采样时间，不保存 `prepare_token`、`seed`、Turnstile / `dx` 等 challenge 数据。
-- PoW 风险等级采用社区工具的启发式规则：去掉前导 0 后，有效十六进制位数 `<=2 / 3 / 4 / >=5` 分别显示为高风险 / 中风险 / 低风险 / 正常。该指标只作为 Sentinel 风控信号参考，并不能单独证明实际模型发生降级。
+- PoW 风险等级采用社区工具的启发式规则：去掉前导 0 后，有效十六进制位数 `<=2 / 3 / 4 / >=5` 分别显示为高风险 / 中风险 / 低风险 / 正常。面板中的“PoW 求解难度”只指 Sentinel challenge 的计算工作量，不是模型推理难度。该指标只作为 Sentinel 风控信号参考，并不能单独证明实际模型发生降级。
+- 用量 / 重置额度 / 订阅信息采用混合策略：若网页自身刚刚请求过对应接口，则复用被动捕获结果；缺失或过期时再由监视器主动补发 GET。手动点击刷新仍强制获取最新数据。
 
 ### 说明
 
