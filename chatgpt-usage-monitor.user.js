@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         ChatGPT 用量监视器
 // @namespace    https://tampermonkey.net/
-// @version      1.1.0
-// @description  在 ChatGPT 页面内显示用量、重置额度和订阅周期信息，无需手工维护 Bearer Token
+// @version      1.2.1
+// @description  在 ChatGPT 页面内显示用量、订阅周期和 PoW 风险提示，无需手工维护 Bearer Token
 // @author       Liu Baoding
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-usage-monitor.user.js
 // @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-usage-monitor.user.js
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-start
 // @noframes
 // ==/UserScript==
 
@@ -23,6 +23,12 @@
     const USAGE_URL = '/backend-api/wham/usage';
     const RESET_CREDITS_URL = '/backend-api/wham/rate-limit-reset-credits';
     const ACCOUNTS_CHECK_URL = '/backend-api/accounts/check/v4-2023-04-27';
+    const SENTINEL_PATHS = [
+        '/backend-api/sentinel/chat-requirements/prepare',
+        '/backend-api/sentinel/chat-requirements',
+        '/backend-anon/sentinel/chat-requirements',
+    ];
+    const POW_STORAGE_KEY = 'chatgpt-usage-monitor-pow-v1';
 
     const ROOT_ID = 'chatgpt-usage-monitor-root';
     const STYLE_ID = 'chatgpt-usage-monitor-style';
@@ -30,10 +36,18 @@
     const INITIAL_REFRESH_DELAY_MS = 1200;
     const INITIAL_RETRY_DELAYS_MS = [1500, 3000, 6000];
     const BACKGROUND_REFRESH_MS = 5 * 60 * 1000;
+    const PASSIVE_CACHE_MS = 30 * 1000;
 
     let lastLoadedAt = 0;
     let lastRawData = null;
+    let lastPowInfo = loadPowInfo();
     let loading = false;
+
+    const observedResponses = {
+        usage: null,
+        resetCredits: null,
+        accountsCheck: null,
+    };
 
     function escapeHtml(value) {
         return String(value ?? '').replace(/[&<>'"]/g, char => ({
@@ -43,6 +57,264 @@
             "'": '&#39;',
             '"': '&quot;',
         })[char]);
+    }
+
+    function loadPowInfo() {
+        try {
+            const raw = sessionStorage.getItem(POW_STORAGE_KEY);
+            if (!raw) return null;
+
+            const value = JSON.parse(raw);
+            if (!value || typeof value !== 'object') return null;
+
+            return {
+                difficulty: String(value.difficulty || ''),
+                persona: String(value.persona || ''),
+                required: value.required === true,
+                capturedAt: Number(value.capturedAt || 0),
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function savePowInfo(info) {
+        lastPowInfo = info;
+
+        try {
+            sessionStorage.setItem(
+                POW_STORAGE_KEY,
+                JSON.stringify(info)
+            );
+        } catch (_) {
+            // sessionStorage may be unavailable in hardened browser modes.
+        }
+
+        renderPowInfo();
+        renderRawJson();
+    }
+
+    function classifyPowDifficulty(difficulty) {
+        const raw = String(difficulty || '').trim();
+        if (!raw) {
+            return {
+                key: 'unknown',
+                label: '未知',
+                solveLabel: '—',
+                color: '#8b8b8b',
+                hexLength: 0,
+            };
+        }
+
+        const cleaned =
+            raw.replace(/^0x/i, '').replace(/^0+/, '') || '0';
+
+        const hexLength = cleaned.length;
+
+        if (hexLength <= 2) {
+            return {
+                key: 'high',
+                label: '高风险',
+                solveLabel: '高',
+                color: '#dc4c43',
+                hexLength,
+            };
+        }
+
+        if (hexLength === 3) {
+            return {
+                key: 'medium',
+                label: '中风险',
+                solveLabel: '中等',
+                color: '#d99a20',
+                hexLength,
+            };
+        }
+
+        if (hexLength === 4) {
+            return {
+                key: 'low',
+                label: '低风险',
+                solveLabel: '较低',
+                color: '#7a9f2b',
+                hexLength,
+            };
+        }
+
+        return {
+            key: 'normal',
+            label: '正常',
+            solveLabel: '很低',
+            color: '#10a37f',
+            hexLength,
+        };
+    }
+
+    function getFetchUrl(resource) {
+        if (typeof resource === 'string') return resource;
+        if (resource instanceof URL) return resource.href;
+        if (typeof Request !== 'undefined' && resource instanceof Request) {
+            return resource.url;
+        }
+        return '';
+    }
+
+    function getFetchMethod(resource, options) {
+        if (options?.method) {
+            return String(options.method).toUpperCase();
+        }
+
+        if (
+            typeof Request !== 'undefined' &&
+            resource instanceof Request
+        ) {
+            return String(resource.method || 'GET').toUpperCase();
+        }
+
+        return 'GET';
+    }
+
+    function isSentinelRequest(resource, options) {
+        const url = getFetchUrl(resource);
+        if (!url) return false;
+
+        const method = getFetchMethod(resource, options);
+        if (method !== 'POST') return false;
+
+        return SENTINEL_PATHS.some(path => url.includes(path));
+    }
+
+    function classifyObservedEndpoint(resource, options) {
+        const url = getFetchUrl(resource);
+        if (!url) return '';
+
+        const method = getFetchMethod(resource, options);
+        if (method !== 'GET') return '';
+
+        if (url.includes(USAGE_URL)) return 'usage';
+        if (url.includes(RESET_CREDITS_URL)) return 'resetCredits';
+        if (url.includes(ACCOUNTS_CHECK_URL)) return 'accountsCheck';
+
+        return '';
+    }
+
+    function cacheObservedResponse(key, data) {
+        if (!key || !data) return;
+
+        observedResponses[key] = {
+            data,
+            capturedAt: Date.now(),
+        };
+    }
+
+    function getFreshObserved(key) {
+        const entry = observedResponses[key];
+        if (!entry) return null;
+
+        if (
+            Date.now() - entry.capturedAt >
+            PASSIVE_CACHE_MS
+        ) {
+            return null;
+        }
+
+        return entry.data;
+    }
+
+    function capturePowResponse(data) {
+        const pow = data?.proofofwork;
+        if (!pow || typeof pow !== 'object') return;
+
+        const difficulty =
+            typeof pow.difficulty === 'string'
+                ? pow.difficulty.trim()
+                : '';
+
+        if (!difficulty) return;
+
+        savePowInfo({
+            difficulty,
+            persona:
+                typeof data.persona === 'string'
+                    ? data.persona
+                    : '',
+            required: pow.required === true,
+            capturedAt: Date.now(),
+        });
+    }
+
+    function installNetworkObserver() {
+        const currentFetch = window.fetch;
+        if (
+            typeof currentFetch !== 'function' ||
+            currentFetch.__cumNetworkObserver
+        ) {
+            return;
+        }
+
+        const wrappedFetch = async function (resource, options) {
+            const response =
+                await currentFetch.apply(
+                    this,
+                    arguments
+                );
+
+            const observedKey =
+                classifyObservedEndpoint(
+                    resource,
+                    options
+                );
+
+            if (
+                observedKey ||
+                isSentinelRequest(
+                    resource,
+                    options
+                )
+            ) {
+                try {
+                    response
+                        .clone()
+                        .json()
+                        .then(data => {
+                            if (observedKey) {
+                                cacheObservedResponse(
+                                    observedKey,
+                                    data
+                                );
+                            }
+
+                            if (
+                                isSentinelRequest(
+                                    resource,
+                                    options
+                                )
+                            ) {
+                                capturePowResponse(
+                                    data
+                                );
+                            }
+                        })
+                        .catch(() => {});
+                } catch (_) {
+                    // Never interfere with ChatGPT's own request lifecycle.
+                }
+            }
+
+            return response;
+        };
+
+        try {
+            Object.defineProperty(
+                wrappedFetch,
+                '__cumNetworkObserver',
+                { value: true }
+            );
+        } catch (_) {
+            // Non-critical marker only.
+        }
+
+        window.fetch = wrappedFetch;
     }
 
     function formatPercent(value) {
@@ -245,38 +517,121 @@
         return response.json();
     }
 
-    async function queryUsage() {
-        const auth = await readSession();
+    async function queryUsage(options = {}) {
+        const {
+            forceNetwork = false,
+        } = options;
 
-        const [usageResult, resetResult, accountsResult] = await Promise.allSettled([
-            fetchJson(USAGE_URL, auth),
-            fetchJson(RESET_CREDITS_URL, auth),
-            fetchJson(ACCOUNTS_CHECK_URL, auth),
-        ]);
+        let usage =
+            forceNetwork
+                ? null
+                : getFreshObserved('usage');
 
-        if (usageResult.status === 'rejected') {
-            throw usageResult.reason;
+        let resetCredits =
+            forceNetwork
+                ? null
+                : getFreshObserved(
+                    'resetCredits'
+                );
+
+        let accountsCheck =
+            forceNetwork
+                ? null
+                : getFreshObserved(
+                    'accountsCheck'
+                );
+
+        let resetCreditsError = '';
+        let accountsCheckError = '';
+        let accountId =
+            lastRawData?.accountId ||
+            '';
+
+        /*
+         * 优先复用网页自己刚刚请求到的数据。
+         * 缺少任何一项时，再读取 session 并只补发缺失的 GET。
+         * 因此“被动监听”是优化层，不是可靠性的单点依赖。
+         */
+        if (
+            !usage ||
+            !resetCredits ||
+            !accountsCheck
+        ) {
+            const auth =
+                await readSession();
+
+            accountId =
+                auth.accountId;
+
+            const requests = [];
+
+            if (!usage) {
+                requests.push(
+                    fetchJson(
+                        USAGE_URL,
+                        auth
+                    ).then(value => {
+                        usage = value;
+                    })
+                );
+            }
+
+            if (!resetCredits) {
+                requests.push(
+                    fetchJson(
+                        RESET_CREDITS_URL,
+                        auth
+                    )
+                        .then(value => {
+                            resetCredits = value;
+                        })
+                        .catch(error => {
+                            resetCreditsError =
+                                String(
+                                    error?.message ||
+                                    error ||
+                                    '请求失败'
+                                );
+                        })
+                );
+            }
+
+            if (!accountsCheck) {
+                requests.push(
+                    fetchJson(
+                        ACCOUNTS_CHECK_URL,
+                        auth
+                    )
+                        .then(value => {
+                            accountsCheck = value;
+                        })
+                        .catch(error => {
+                            accountsCheckError =
+                                String(
+                                    error?.message ||
+                                    error ||
+                                    '请求失败'
+                                );
+                        })
+                );
+            }
+
+            await Promise.all(requests);
+        }
+
+        if (!usage) {
+            throw new Error(
+                '未能取得 ChatGPT 用量数据'
+            );
         }
 
         return {
-            usage: usageResult.value,
-            resetCredits:
-                resetResult.status === 'fulfilled'
-                    ? resetResult.value
-                    : null,
-            resetCreditsError:
-                resetResult.status === 'rejected'
-                    ? String(resetResult.reason?.message || resetResult.reason || '请求失败')
-                    : '',
-            accountsCheck:
-                accountsResult.status === 'fulfilled'
-                    ? accountsResult.value
-                    : null,
-            accountsCheckError:
-                accountsResult.status === 'rejected'
-                    ? String(accountsResult.reason?.message || accountsResult.reason || '请求失败')
-                    : '',
-            accountId: auth.accountId,
+            usage,
+            resetCredits,
+            resetCreditsError,
+            accountsCheck,
+            accountsCheckError,
+            accountId,
         };
     }
 
@@ -296,8 +651,8 @@
                 --cum-accent: #10a37f;
                 --cum-danger: #c2413b;
                 position: fixed;
-                right: 18px;
-                bottom: 72px;
+                right: 22px;
+                bottom: 118px;
                 z-index: 2147483000;
                 font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
                 color: var(--cum-text);
@@ -318,45 +673,89 @@
             }
 
             #cum-trigger {
-                min-width: 126px;
-                height: 38px;
-                border: 1px solid var(--cum-border);
-                border-radius: 999px;
-                background: var(--cum-bg);
+                width: 52px;
+                padding: 0;
+                margin: 0;
+                border: 0;
+                background: transparent;
                 color: var(--cum-text);
-                box-shadow: 0 8px 26px rgba(0, 0, 0, 0.14);
-                padding: 0 14px;
                 cursor: pointer;
-                font-size: 13px;
-                font-weight: 600;
                 display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 8px;
+            }
+
+            #cum-trigger:focus-visible {
+                outline: 2px solid var(--cum-accent);
+                outline-offset: 4px;
+                border-radius: 18px;
+            }
+
+            .cum-limit-ring {
+                --cum-ring-value: 0;
+                --cum-ring-color: var(--cum-accent);
+                position: relative;
+                width: 48px;
+                height: 48px;
+                border-radius: 50%;
+                display: grid;
+                place-items: center;
+                background:
+                    conic-gradient(
+                        var(--cum-ring-color) calc(var(--cum-ring-value) * 1%),
+                        var(--cum-bg-strong) 0
+                    );
+                box-shadow:
+                    0 5px 18px rgba(0, 0, 0, 0.14),
+                    0 0 0 1px var(--cum-border);
+                transition: transform 0.15s ease;
+            }
+
+            #cum-trigger:hover .cum-limit-ring {
+                transform: translateX(-2px);
+            }
+
+            .cum-limit-ring::before {
+                content: "";
+                position: absolute;
+                inset: 4px;
+                border-radius: inherit;
+                background: var(--cum-bg);
+                box-shadow: inset 0 0 0 1px var(--cum-border);
+            }
+
+            .cum-limit-ring-content {
+                position: relative;
+                z-index: 1;
+                display: flex;
+                flex-direction: column;
                 align-items: center;
                 justify-content: center;
-                gap: 7px;
+                line-height: 1;
             }
 
-            #cum-trigger:hover {
-                background: var(--cum-bg-soft);
+            .cum-limit-ring-label {
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: -0.02em;
             }
 
-            #cum-trigger[data-state="error"] {
-                color: var(--cum-danger);
-            }
-
-            #cum-trigger-dot {
-                width: 8px;
-                height: 8px;
-                border-radius: 50%;
-                background: var(--cum-accent);
-                flex: none;
+            .cum-limit-ring-value {
+                margin-top: 3px;
+                color: var(--cum-muted);
+                font-size: 8px;
+                font-variant-numeric: tabular-nums;
             }
 
             #cum-panel {
-                position: absolute;
-                right: 0;
-                bottom: 48px;
-                width: min(390px, calc(100vw - 24px));
-                max-height: min(660px, calc(100vh - 130px));
+                position: fixed;
+                right: 84px;
+                top: 50%;
+                bottom: auto;
+                transform: translateY(-50%);
+                width: min(400px, calc(100vw - 112px));
+                max-height: min(690px, calc(100vh - 32px));
                 display: none;
                 flex-direction: column;
                 overflow: hidden;
@@ -499,6 +898,44 @@
                 margin-bottom: 9px;
             }
 
+            .cum-pow-card {
+                border: 1px solid var(--cum-border);
+                border-radius: 13px;
+                padding: 12px;
+                background: var(--cum-bg-soft);
+            }
+
+            .cum-pow-head {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                margin-bottom: 9px;
+            }
+
+            .cum-pow-title {
+                font-size: 12px;
+                font-weight: 700;
+            }
+
+            .cum-pow-badge {
+                display: inline-flex;
+                align-items: center;
+                min-height: 22px;
+                padding: 0 8px;
+                border-radius: 999px;
+                color: #fff;
+                font-size: 11px;
+                font-weight: 700;
+            }
+
+            .cum-pow-note {
+                margin-top: 8px;
+                color: var(--cum-muted);
+                font-size: 10px;
+                line-height: 1.5;
+            }
+
             .cum-credit-list {
                 display: grid;
                 gap: 8px;
@@ -565,14 +1002,24 @@
                 line-height: 1.5;
             }
 
-            @media (max-width: 520px) {
+            @media (max-width: 700px) {
                 #${ROOT_ID} {
-                    right: 12px;
-                    bottom: 68px;
+                    right: 10px;
+                    bottom: 108px;
                 }
 
                 #cum-panel {
-                    width: calc(100vw - 24px);
+                    right: 10px;
+                    top: 12px;
+                    bottom: auto;
+                    transform: none;
+                    width: calc(100vw - 20px);
+                    max-height: calc(100vh - 24px);
+                }
+
+                .cum-limit-ring {
+                    width: 44px;
+                    height: 44px;
                 }
             }
         `;
@@ -589,8 +1036,18 @@
         root.id = ROOT_ID;
         root.innerHTML = `
             <button id="cum-trigger" type="button" title="查看 ChatGPT 用量">
-                <span id="cum-trigger-dot"></span>
-                <span id="cum-trigger-text">Usage · —</span>
+                <span class="cum-limit-ring" id="cum-ring-5h">
+                    <span class="cum-limit-ring-content">
+                        <span class="cum-limit-ring-label">5h</span>
+                        <span class="cum-limit-ring-value" id="cum-ring-5h-value">—</span>
+                    </span>
+                </span>
+                <span class="cum-limit-ring" id="cum-ring-week">
+                    <span class="cum-limit-ring-content">
+                        <span class="cum-limit-ring-label">周</span>
+                        <span class="cum-limit-ring-value" id="cum-ring-week-value">—</span>
+                    </span>
+                </span>
             </button>
 
             <section id="cum-panel" data-open="false" aria-label="ChatGPT 用量">
@@ -606,8 +1063,14 @@
                 </header>
 
                 <div class="cum-body">
-                    <div class="cum-status" id="cum-status">打开面板后自动读取当前 ChatGPT 会话。</div>
+                    <div class="cum-status" id="cum-status">正在读取当前 ChatGPT 会话。</div>
                     <div class="cum-grid" id="cum-grid"></div>
+
+                    <section class="cum-section">
+                        <div class="cum-section-title">PoW 风险提示</div>
+                        <div id="cum-pow"></div>
+                    </section>
+
                     <div id="cum-details"></div>
 
                     <details class="cum-section">
@@ -616,7 +1079,7 @@
                     </details>
 
                     <div class="cum-footer-note">
-                        Bearer Token 仅从当前 ChatGPT 登录会话读取并保存在内存中，不写入 localStorage、Tampermonkey 存储或本地文件。
+                        Bearer Token 仅从当前 ChatGPT 登录会话读取并保存在内存中。PoW 区域只保存 difficulty、persona 和采样时间到当前标签页的 sessionStorage，不保存 challenge token、seed 或 dx。
                     </div>
                 </div>
             </section>
@@ -645,7 +1108,9 @@
         });
 
         refresh.addEventListener('click', () => {
-            void refreshUsage();
+            void refreshUsage({
+                forceNetwork: true,
+            });
         });
 
         close.addEventListener('click', () => {
@@ -657,6 +1122,9 @@
                 panel.dataset.open = 'false';
             }
         });
+
+        renderPowInfo();
+        renderRawJson();
 
         return root;
     }
@@ -680,6 +1148,168 @@
                 <div class="cum-card-sub">${escapeHtml(sub)}</div>
             </article>
         `;
+    }
+
+    function updateLimitRing(id, value, fallback = '—') {
+        const ring =
+            document.getElementById(id);
+
+        if (!ring) return;
+
+        const label =
+            ring.querySelector(
+                '.cum-limit-ring-value'
+            );
+
+        if (!Number.isFinite(value)) {
+            ring.style.setProperty(
+                '--cum-ring-value',
+                '0'
+            );
+            label.textContent = fallback;
+            return;
+        }
+
+        const percent =
+            Math.min(
+                Math.max(value, 0),
+                100
+            );
+
+        ring.style.setProperty(
+            '--cum-ring-value',
+            String(percent)
+        );
+
+        label.textContent =
+            `${Math.round(percent)}%`;
+
+        const color =
+            percent <= 20
+                ? '#dc4c43'
+                : percent <= 50
+                    ? '#d99a20'
+                    : '#10a37f';
+
+        ring.style.setProperty(
+            '--cum-ring-color',
+            color
+        );
+    }
+
+    function renderPowInfo() {
+        const container =
+            document.getElementById(
+                'cum-pow'
+            );
+
+        if (!container) return;
+
+        if (
+            !lastPowInfo ||
+            !lastPowInfo.difficulty
+        ) {
+            container.innerHTML = `
+                <div class="cum-pow-card">
+                    <div class="cum-pow-head">
+                        <div class="cum-pow-title">尚未观察到 PoW difficulty</div>
+                        <span class="cum-pow-badge" style="background:#8b8b8b;">等待</span>
+                    </div>
+                    <div class="cum-pow-note">
+                        本监视器不会主动重复调用 Sentinel prepare。发送下一条 ChatGPT 消息时，会被动读取网页自身 prepare 响应中的 difficulty。
+                    </div>
+                </div>
+            `;
+            return;
+        }
+
+        const risk =
+            classifyPowDifficulty(
+                lastPowInfo.difficulty
+            );
+
+        container.innerHTML = `
+            <div class="cum-pow-card">
+                <div class="cum-pow-head">
+                    <div class="cum-pow-title">ChatGPT PoW 风险</div>
+                    <span class="cum-pow-badge" style="background:${risk.color};">
+                        ${escapeHtml(risk.label)}
+                    </span>
+                </div>
+
+                <div class="cum-detail-row">
+                    <span>difficulty 原值</span>
+                    <span>${escapeHtml(lastPowInfo.difficulty)}</span>
+                </div>
+
+                <div class="cum-detail-row">
+                    <span>PoW 求解难度</span>
+                    <span>${escapeHtml(risk.solveLabel)}</span>
+                </div>
+
+                <div class="cum-detail-row">
+                    <span>有效十六进制位数</span>
+                    <span>${risk.hexLength}</span>
+                </div>
+
+                <div class="cum-detail-row">
+                    <span>Persona</span>
+                    <span>${escapeHtml(lastPowInfo.persona || '—')}</span>
+                </div>
+
+                <div class="cum-detail-row">
+                    <span>最近观测</span>
+                    <span>${escapeHtml(
+                        lastPowInfo.capturedAt
+                            ? new Date(lastPowInfo.capturedAt).toLocaleString('zh-CN', { hour12: false })
+                            : '—'
+                    )}</span>
+                </div>
+
+                <div class="cum-pow-note">
+                    “PoW 求解难度”只表示 Sentinel challenge 所需计算工作量，不是模型推理难度。这里沿用社区插件的启发式规则：去掉前导 0 后，difficulty 的十六进制位数越少，通常意味着 PoW 越难、风控信号越强。该指标不能单独证明模型发生了“降智”或路由降级。
+                </div>
+            </div>
+        `;
+
+        const trigger =
+            document.getElementById(
+                'cum-trigger'
+            );
+
+        if (trigger) {
+            trigger.title =
+                `5h / 周限额 · PoW ${lastPowInfo.difficulty} · ${risk.label}`;
+        }
+    }
+
+    function renderRawJson() {
+        const raw =
+            document.getElementById(
+                'cum-raw'
+            );
+
+        if (!raw) return;
+
+        raw.textContent =
+            JSON.stringify(
+                {
+                    usage:
+                        lastRawData?.usage ||
+                        null,
+                    rate_limit_reset_credits:
+                        lastRawData?.resetCredits ||
+                        null,
+                    accounts_check:
+                        lastRawData?.accountsCheck ||
+                        null,
+                    pow_observation:
+                        lastPowInfo ||
+                        null,
+                },
+                null,
+                2
+            );
     }
 
     function renderData(data) {
@@ -754,12 +1384,25 @@
             'ChatGPT 当前账号';
 
         const trigger = root.querySelector('#cum-trigger');
-        const triggerText = root.querySelector('#cum-trigger-text');
-
         trigger.dataset.state = allowed ? 'ok' : 'error';
-        triggerText.textContent = primary
-            ? `5h ${formatPercent(primaryRemaining)} · Week ${secondary ? formatPercent(secondaryRemaining) : '∞'}`
-            : 'Usage · 已更新';
+
+        updateLimitRing(
+            'cum-ring-5h',
+            primaryRemaining
+        );
+
+        updateLimitRing(
+            'cum-ring-week',
+            secondary
+                ? secondaryRemaining
+                : null,
+            secondary ? '—' : '∞'
+        );
+
+        if (!lastPowInfo) {
+            trigger.title =
+                `5 小时剩余 ${primary ? formatPercent(primaryRemaining) : '—'} · 周限额 ${secondary ? formatPercent(secondaryRemaining) : '∞'}`;
+        }
 
         const status = root.querySelector('#cum-status');
         status.className = 'cum-status';
@@ -906,11 +1549,8 @@
         }
 
         root.querySelector('#cum-details').innerHTML = detailHtml;
-        root.querySelector('#cum-raw').textContent = JSON.stringify({
-            usage: data.usage,
-            rate_limit_reset_credits: data.resetCredits,
-            accounts_check: data.accountsCheck,
-        }, null, 2);
+        renderPowInfo();
+        renderRawJson();
     }
 
     function renderLoading() {
@@ -922,7 +1562,19 @@
         status.textContent = '正在读取当前 ChatGPT 登录会话和用量数据…';
 
         root.querySelector('#cum-refresh').disabled = true;
-        root.querySelector('#cum-trigger-text').textContent = 'Usage · …';
+
+        if (!lastRawData) {
+            updateLimitRing(
+                'cum-ring-5h',
+                null,
+                '…'
+            );
+            updateLimitRing(
+                'cum-ring-week',
+                null,
+                '…'
+            );
+        }
     }
 
     function renderError(error) {
@@ -936,14 +1588,24 @@
 
         const trigger = root.querySelector('#cum-trigger');
         trigger.dataset.state = 'error';
-        root.querySelector('#cum-trigger-text').textContent = 'Usage · Error';
+
+        if (!lastRawData) {
+            updateLimitRing(
+                'cum-ring-5h',
+                null,
+                '!'
+            );
+            updateLimitRing(
+                'cum-ring-week',
+                null,
+                '!'
+            );
+        }
 
         if (!lastRawData) {
             root.querySelector('#cum-grid').innerHTML = '';
             root.querySelector('#cum-details').innerHTML = '';
-            root.querySelector('#cum-raw').textContent = JSON.stringify({
-                error: message,
-            }, null, 2);
+            renderRawJson();
         }
     }
 
@@ -952,13 +1614,17 @@
 
         const {
             showError = true,
+            forceNetwork = false,
         } = options;
 
         loading = true;
         renderLoading();
 
         try {
-            const data = await queryUsage();
+            const data =
+                await queryUsage({
+                    forceNetwork,
+                });
             lastRawData = data;
             lastLoadedAt = Date.now();
             renderData(data);
@@ -1039,6 +1705,7 @@
     }
 
     function init() {
+        installNetworkObserver();
         injectStyle();
 
         if (document.body) {
