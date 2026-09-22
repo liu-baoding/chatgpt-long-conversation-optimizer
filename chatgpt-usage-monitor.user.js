@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 用量监视器
 // @namespace    https://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  在 ChatGPT 页面内直接读取当前登录会话并显示 5 小时/周限额、重置额度和使用状态，无需手工维护 Bearer Token
 // @author       Liu Baoding
 // @match        https://chatgpt.com/*
@@ -26,6 +26,9 @@
     const ROOT_ID = 'chatgpt-usage-monitor-root';
     const STYLE_ID = 'chatgpt-usage-monitor-style';
     const STALE_AFTER_MS = 60 * 1000;
+    const INITIAL_REFRESH_DELAY_MS = 1200;
+    const INITIAL_RETRY_DELAYS_MS = [1500, 3000, 6000];
+    const BACKGROUND_REFRESH_MS = 5 * 60 * 1000;
 
     let lastLoadedAt = 0;
     let lastRawData = null;
@@ -823,8 +826,12 @@
         }
     }
 
-    async function refreshUsage() {
-        if (loading) return;
+    async function refreshUsage(options = {}) {
+        if (loading) return false;
+
+        const {
+            showError = true,
+        } = options;
 
         loading = true;
         renderLoading();
@@ -834,9 +841,15 @@
             lastRawData = data;
             lastLoadedAt = Date.now();
             renderData(data);
+            return true;
         } catch (error) {
             console.error('[ChatGPT Usage Monitor]', error);
-            renderError(error);
+
+            if (showError) {
+                renderError(error);
+            }
+
+            return false;
         } finally {
             loading = false;
             const root = document.getElementById(ROOT_ID);
@@ -846,15 +859,69 @@
         }
     }
 
+    function scheduleInitialRefresh() {
+        setTimeout(async () => {
+            const firstOk = await refreshUsage({ showError: false });
+            if (firstOk) return;
+
+            for (let index = 0; index < INITIAL_RETRY_DELAYS_MS.length; index += 1) {
+                await new Promise(resolve => {
+                    setTimeout(resolve, INITIAL_RETRY_DELAYS_MS[index]);
+                });
+
+                const isLastAttempt =
+                    index === INITIAL_RETRY_DELAYS_MS.length - 1;
+
+                const ok = await refreshUsage({
+                    showError: isLastAttempt,
+                });
+
+                if (ok) return;
+            }
+        }, INITIAL_REFRESH_DELAY_MS);
+    }
+
+    function installAutoRefresh() {
+        window.setInterval(() => {
+            if (
+                document.visibilityState === 'visible' &&
+                (
+                    !lastLoadedAt ||
+                    Date.now() - lastLoadedAt >= BACKGROUND_REFRESH_MS
+                )
+            ) {
+                void refreshUsage({ showError: false });
+            }
+        }, BACKGROUND_REFRESH_MS);
+
+        document.addEventListener('visibilitychange', () => {
+            if (
+                document.visibilityState === 'visible' &&
+                (
+                    !lastLoadedAt ||
+                    Date.now() - lastLoadedAt >= STALE_AFTER_MS
+                )
+            ) {
+                void refreshUsage({ showError: false });
+            }
+        });
+    }
+
+    function startUi() {
+        createUi();
+        scheduleInitialRefresh();
+        installAutoRefresh();
+    }
+
     function init() {
         injectStyle();
 
         if (document.body) {
-            createUi();
+            startUi();
             return;
         }
 
-        document.addEventListener('DOMContentLoaded', createUi, { once: true });
+        document.addEventListener('DOMContentLoaded', startUi, { once: true });
     }
 
     init();
