@@ -1,6 +1,5 @@
 // ==UserScript==
-// @name         ChatGPT 长对话性能优化器
-// @name:en      ChatGPT Long Conversation Optimizer
+// @name         ChatGPT 消息限高 + 离屏渲染休眠（纯净版）
 // @namespace    https://tampermonkey.net/
 // @version      4.0.0
 // @description  仅保留用户/助手消息限高和离屏渲染优化，不处理公式、剪贴板、表格或对话折叠
