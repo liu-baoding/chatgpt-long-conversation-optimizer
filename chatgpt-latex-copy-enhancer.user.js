@@ -1,12 +1,27 @@
 // ==UserScript==
-// @name         ChatGPT LaTeX 悬浮与复制增强
+// @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
-// @description  为 ChatGPT 提供公式悬浮预览、单公式复制、选择复制和回复复制按钮修复
+// @version      3.0.0
+// @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站提供公式悬浮预览、单公式复制、选择复制和复制按钮修复
 // @license      MIT
-// @author       Liu Baoding; selection-copy strategy adapted from fanxing's AI网站公式复制Latex (MIT)
+// @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
+// @match        *://claude.ai/*
+// @match        *://demo.fuclaude.oaifree.com/*
+// @match        *://*.deepseek.com/*
+// @match        *://chat.deepseek.com/*
+// @match        *://gemini.google.com/*
+// @match        *://aistudio.google.com/*
+// @match        *://*.doubao.com/*
+// @match        *://*.zhihu.com/*
+// @match        *://*.wikipedia.org/*
+// @match        *://*.x.liaox.ai/*
+// @match        *://*.moonshot.cn/*
+// @match        *://*.stackexchange.com/*
+// @match        *://*.oi-wiki.org/*
+// @match        *://*.luogu.com/*
+// @match        *://*.yuanbao.tencent.com/*
 // @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-latex-copy-enhancer.user.js
 // @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-latex-copy-enhancer.user.js
 // @grant        none
@@ -15,12 +30,447 @@
 (function () {
     'use strict';
 
-    if (window.__chatgptLatexEnhancerLoaded) return;
-    window.__chatgptLatexEnhancerLoaded = true;
+    if (window.__aiLatexEnhancerLoaded) return;
+    window.__aiLatexEnhancerLoaded = true;
 
-    const FORMULA_CONTAINER_SELECTOR = '[data-client-katex-layout][aria-label], [data-markdown-copy="math"][aria-label]';
-    const FORMULA_SELECTOR = '.katex';
-    const HOVER_CLASS = 'chatgpt-latex-hover';
+    const CHATGPT_FORMULA_CONTAINER_SELECTOR =
+        '[data-client-katex-layout][aria-label], [data-markdown-copy="math"][aria-label]';
+    const TEX_ANNOTATION = 'annotation[encoding="application/x-tex"]';
+
+    function elementFromNode(node) {
+        if (node instanceof Element) return node;
+        return node && node.parentElement instanceof Element ? node.parentElement : null;
+    }
+
+    function hostMatches(...domains) {
+        const host = location.hostname.toLowerCase();
+        return domains.some(domain => host === domain || host.endsWith('.' + domain));
+    }
+
+    function isDisplayFormula(element) {
+        if (!element) return false;
+        return Boolean(
+            element.closest('.katex-display, .math-display, .math-block, .ds-markdown-math') ||
+            element.matches('.katex-display, .math-display, .math-block, .ds-markdown-math') ||
+            (element.tagName === 'MS-KATEX' && !element.classList.contains('inline')) ||
+            (element.closest('ms-katex') &&
+                !element.closest('ms-katex').classList.contains('inline'))
+        );
+    }
+
+    function annotationFormulaInfo(node, options = {}) {
+        const element = elementFromNode(node);
+        if (!element) return null;
+
+        const selector =
+            options.selector ||
+            '.katex, .math-inline, .math-display, ms-katex, span.math';
+
+        let carrier = element.closest(selector);
+        if (!carrier && element.matches(selector)) carrier = element;
+        if (!carrier) return null;
+
+        const annotation = carrier.querySelector(TEX_ANNOTATION);
+        if (!annotation || !annotation.textContent.trim()) return null;
+
+        const katex =
+            carrier.matches('.katex')
+                ? carrier
+                : carrier.querySelector('.katex');
+
+        const display =
+            typeof options.display === 'function'
+                ? options.display(carrier, katex)
+                : isDisplayFormula(carrier);
+
+        const container =
+            typeof options.container === 'function'
+                ? options.container(carrier, katex, display)
+                : (
+                    (display &&
+                        carrier.closest(
+                            '.katex-display, .math-display, .math-block, .ds-markdown-math'
+                        )) ||
+                    carrier
+                );
+
+        return {
+            katex: katex || carrier,
+            container: container || carrier,
+            latex: annotation.textContent.trim(),
+            display,
+            visibleText:
+                ((katex || carrier).innerText ||
+                    (katex || carrier).textContent ||
+                    '').trim()
+        };
+    }
+
+    function chatgptFormulaInfo(node) {
+        const element = elementFromNode(node);
+        const katex = element && element.closest('.katex');
+        if (!katex) return null;
+
+        const container =
+            katex.closest(CHATGPT_FORMULA_CONTAINER_SELECTOR);
+        const annotation = katex.querySelector(TEX_ANNOTATION);
+        const latex =
+            (container && container.getAttribute('aria-label')) ||
+            (annotation && annotation.textContent);
+
+        if (!latex || !latex.trim()) return null;
+
+        return {
+            katex,
+            container:
+                container ||
+                katex.closest('.katex-display') ||
+                katex,
+            latex: latex.trim(),
+            display: Boolean(katex.closest('.katex-display')),
+            visibleText:
+                (katex.innerText || katex.textContent || '').trim()
+        };
+    }
+
+    function doubaoFormulaInfo(node) {
+        const element = elementFromNode(node);
+        if (!element) return null;
+
+        const container =
+            element.closest('.container-rkuXQi') ||
+            element.closest('.katex, .math-inline, .math-display');
+        if (!container) return null;
+
+        const customCopyText =
+            container.getAttribute('data-custom-copy-text') ||
+            element.getAttribute('data-custom-copy-text');
+
+        if (customCopyText && customCopyText.trim()) {
+            const katex =
+                container.querySelector('.katex') ||
+                container;
+            const display = Boolean(
+                container.querySelector('.katex-display') ||
+                container.closest('.katex-display, .math-display') ||
+                container.classList.contains('math-display') ||
+                (
+                    !container.classList.contains('math-inline') &&
+                    !element.classList.contains('math-inline')
+                )
+            );
+
+            return {
+                katex,
+                container,
+                latex: customCopyText.trim(),
+                display,
+                visibleText:
+                    (katex.innerText || katex.textContent || '').trim()
+            };
+        }
+
+        return annotationFormulaInfo(element, {
+            selector: '.katex, .math-inline, .math-display'
+        });
+    }
+
+    function zhihuFormulaInfo(node) {
+        const element = elementFromNode(node);
+        const formula = element && element.closest('.ztext-math');
+        if (!formula) return null;
+
+        const latex = formula.getAttribute('data-tex');
+        if (!latex || !latex.trim()) return null;
+
+        return {
+            katex: formula,
+            container: formula,
+            latex: latex.trim(),
+            display: formula.classList.contains('ztext-math-block'),
+            visibleText:
+                (formula.innerText || formula.textContent || '').trim()
+        };
+    }
+
+    const geminiKatexMap = new Map();
+    let geminiHookInstalled = false;
+    let geminiHookTimer = null;
+
+    function hookGeminiKatexRender(katexObject) {
+        if (!katexObject || typeof katexObject.render !== 'function') {
+            return false;
+        }
+
+        if (katexObject.render.__aiLatexHooked) {
+            geminiHookInstalled = true;
+            return true;
+        }
+
+        const originalRender = katexObject.render;
+        const wrappedRender = function (...args) {
+            const result = originalRender.apply(this, args);
+
+            try {
+                const latex = args[0];
+                const target = args[1];
+
+                if (
+                    typeof latex === 'string' &&
+                    target instanceof Element
+                ) {
+                    const katexHtml =
+                        target.querySelector('.katex-html');
+
+                    if (katexHtml) {
+                        geminiKatexMap.set(
+                            katexHtml.outerHTML,
+                            latex
+                        );
+                        katexHtml.setAttribute(
+                            'data-ai-latex-source',
+                            latex
+                        );
+                    }
+                }
+            } catch (_) {
+                // Never interfere with the site's renderer.
+            }
+
+            return result;
+        };
+
+        try {
+            Object.defineProperty(
+                wrappedRender,
+                '__aiLatexHooked',
+                { value: true }
+            );
+            katexObject.render = wrappedRender;
+            geminiHookInstalled = true;
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function prepareGeminiHook() {
+        const tryHook = () => {
+            if (geminiHookInstalled) return true;
+            return Boolean(
+                window.katex &&
+                hookGeminiKatexRender(window.katex)
+            );
+        };
+
+        tryHook();
+
+        let attempts = 0;
+        geminiHookTimer = window.setInterval(() => {
+            attempts += 1;
+            if (tryHook() || attempts >= 80) {
+                clearInterval(geminiHookTimer);
+                geminiHookTimer = null;
+            }
+        }, 250);
+    }
+
+    function geminiFormulaInfo(node) {
+        const element = elementFromNode(node);
+        if (!element) return null;
+
+        const katexHtml =
+            element.closest('.katex-html') ||
+            element.querySelector?.('.katex-html');
+
+        const katex =
+            element.closest('.katex') ||
+            (katexHtml && katexHtml.closest('.katex'));
+
+        if (katex) {
+            const annotation =
+                katex.querySelector(TEX_ANNOTATION);
+
+            if (
+                annotation &&
+                annotation.textContent &&
+                annotation.textContent.trim()
+            ) {
+                return {
+                    katex,
+                    container:
+                        katex.closest(
+                            '.math-block, .katex-display'
+                        ) ||
+                        katex,
+                    latex: annotation.textContent.trim(),
+                    display: isDisplayFormula(katex),
+                    visibleText:
+                        (katex.innerText ||
+                            katex.textContent ||
+                            '').trim()
+                };
+            }
+        }
+
+        if (!katexHtml) return null;
+
+        const latex =
+            katexHtml.getAttribute('data-ai-latex-source') ||
+            geminiKatexMap.get(katexHtml.outerHTML);
+
+        if (!latex) return null;
+
+        return {
+            katex: katex || katexHtml,
+            container:
+                (katex || katexHtml).closest(
+                    '.math-block, .katex-display'
+                ) ||
+                katex ||
+                katexHtml,
+            latex,
+            display: isDisplayFormula(katex || katexHtml),
+            visibleText:
+                ((katex || katexHtml).innerText ||
+                    (katex || katexHtml).textContent ||
+                    '').trim()
+        };
+    }
+
+    function isCodeCopyButton(button) {
+        return Boolean(
+            button &&
+            button.closest(
+                'pre, code, .code-block, [class*="code-block"], [class*="codeBlock"], [data-code-block]'
+            )
+        );
+    }
+
+    const SITE_ADAPTERS = [
+        {
+            id: 'chatgpt',
+            name: 'ChatGPT',
+            matches: () =>
+                hostMatches('chatgpt.com', 'chat.openai.com'),
+            selectionSelector:
+                '[data-client-katex-layout][aria-label] .katex, ' +
+                '[data-markdown-copy="math"][aria-label] .katex, .katex',
+            getFormulaInfo: chatgptFormulaInfo,
+            replyCopyMode: 'chatgpt'
+        },
+        {
+            id: 'claude',
+            name: 'Claude',
+            matches: () =>
+                hostMatches(
+                    'claude.ai',
+                    'fuclaude.oaifree.com'
+                ),
+            selectionSelector:
+                '.katex, .math-inline, .math-display',
+            getFormulaInfo: node =>
+                annotationFormulaInfo(node, {
+                    selector:
+                        '.katex, .math-inline, .math-display'
+                })
+        },
+        {
+            id: 'deepseek',
+            name: 'DeepSeek',
+            matches: () => hostMatches('deepseek.com'),
+            selectionSelector: '.katex',
+            getFormulaInfo: node =>
+                annotationFormulaInfo(node, {
+                    selector: '.katex',
+                    display: carrier =>
+                        Boolean(
+                            carrier.closest(
+                                '.ds-markdown-math, .katex-display'
+                            )
+                        ),
+                    container: carrier =>
+                        carrier.closest(
+                            '.ds-markdown-math, .katex-display'
+                        ) ||
+                        carrier
+                }),
+            replyCopyMode: 'normalize'
+        },
+        {
+            id: 'gemini',
+            name: 'Google Gemini',
+            matches: () =>
+                hostMatches('gemini.google.com'),
+            selectionSelector:
+                '.katex, .katex-html, .math-inline, .math-display, .math-block',
+            getFormulaInfo: geminiFormulaInfo,
+            stopImmediateOnSelection: true,
+            expandSelectionToFormula: true,
+            beforeInit: prepareGeminiHook
+        },
+        {
+            id: 'aistudio',
+            name: 'Google AI Studio',
+            matches: () =>
+                hostMatches('aistudio.google.com'),
+            selectionSelector:
+                'ms-katex, .katex, .math-inline, .math-display',
+            getFormulaInfo: node =>
+                annotationFormulaInfo(node, {
+                    selector:
+                        'ms-katex, .katex, .math-inline, .math-display'
+                })
+        },
+        {
+            id: 'doubao',
+            name: '豆包',
+            matches: () => hostMatches('doubao.com'),
+            selectionSelector:
+                '.container-rkuXQi, .katex, .math-inline, .math-display',
+            getFormulaInfo: doubaoFormulaInfo,
+            replyCopyMode: 'normalize'
+        },
+        {
+            id: 'zhihu',
+            name: '知乎',
+            matches: () => hostMatches('zhihu.com'),
+            selectionSelector: '.ztext-math',
+            getFormulaInfo: zhihuFormulaInfo
+        },
+        {
+            id: 'generic-katex',
+            name: 'KaTeX site',
+            matches: () =>
+                [
+                    'wikipedia.org',
+                    'x.liaox.ai',
+                    'moonshot.cn',
+                    'stackexchange.com',
+                    'oi-wiki.org',
+                    'luogu.com',
+                    'yuanbao.tencent.com'
+                ].some(domain => hostMatches(domain)),
+            selectionSelector:
+                '.katex, .math-inline, .math-display, span.math',
+            getFormulaInfo: node =>
+                annotationFormulaInfo(node, {
+                    selector:
+                        '.katex, .math-inline, .math-display, span.math'
+                })
+        }
+    ];
+
+    const ACTIVE_ADAPTER =
+        SITE_ADAPTERS.find(adapter => adapter.matches());
+
+    if (!ACTIVE_ADAPTER) return;
+
+    if (typeof ACTIVE_ADAPTER.beforeInit === 'function') {
+        ACTIVE_ADAPTER.beforeInit();
+    }
+
+        const HOVER_CLASS = 'chatgpt-latex-hover';
     let activeFormulaContainer = null;
     let previewTimer = null;
 
@@ -82,25 +532,7 @@
      * 不扫描、不缓存，也不在 DOM 上写入任何处理标记。
      */
     function getFormulaInfo(node) {
-        const element = node instanceof Element ? node : node && node.parentElement;
-        const katex = element && element.closest(FORMULA_SELECTOR);
-        if (!katex) return null;
-
-        const container = katex.closest(FORMULA_CONTAINER_SELECTOR);
-        const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
-        const latex =
-            (container && container.getAttribute('aria-label')) ||
-            (annotation && annotation.textContent);
-
-        if (!latex || !latex.trim()) return null;
-
-        return {
-            katex,
-            container: container || katex,
-            latex: latex.trim(),
-            display: Boolean(katex.closest('.katex-display')),
-            visibleText: (katex.innerText || katex.textContent || '').trim()
-        };
+        return ACTIVE_ADAPTER.getFormulaInfo(node);
     }
 
     function formatLatex(info) {
@@ -184,208 +616,356 @@
     }
 
     function getAssistantReplyRoot(button) {
-        if (!button) return null;
+        if (
+            ACTIVE_ADAPTER.id !== 'chatgpt' ||
+            !button
+        ) {
+            return null;
+        }
 
-        /*
-         * 2026-09 新版 ChatGPT：
-         * assistant 的回复正文和 action bar 位于同一个 :assistant unit 内。
-         */
-        const directAssistant = button.closest(
-            '[data-content-search-unit-key$=":assistant"]'
-        );
-        if (directAssistant) return directAssistant;
-
-        const turn = button.closest('[data-turn-key]');
-        if (turn) {
-            const assistantUnit = turn.querySelector(
+        const directAssistant =
+            button.closest(
                 '[data-content-search-unit-key$=":assistant"]'
             );
-            if (assistantUnit) return assistantUnit;
 
-            const markdown = turn.querySelector(
-                '[data-markdown-text-style="assistant-message"]'
-            );
+        if (directAssistant) {
+            return directAssistant;
+        }
+
+        const turn =
+            button.closest('[data-turn-key]');
+
+        if (turn) {
+            const assistantUnit =
+                turn.querySelector(
+                    '[data-content-search-unit-key$=":assistant"]'
+                );
+
+            if (assistantUnit) {
+                return assistantUnit;
+            }
+
+            const markdown =
+                turn.querySelector(
+                    '[data-markdown-text-style="assistant-message"]'
+                );
+
             if (markdown) {
-                return markdown.closest('[data-content-search-unit-key]') || markdown;
+                return (
+                    markdown.closest(
+                        '[data-content-search-unit-key]'
+                    ) ||
+                    markdown
+                );
             }
         }
 
-        // 旧版兼容。
-        const directMessage = button.closest('[data-message-author-role="assistant"]');
-        if (directMessage) return directMessage;
+        const directMessage =
+            button.closest(
+                '[data-message-author-role="assistant"]'
+            );
 
-        const oldTurn = button.closest(
-            'article[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"]'
-        );
-        if (!oldTurn || !oldTurn.querySelector('[data-message-author-role="assistant"]')) {
+        if (directMessage) {
+            return directMessage;
+        }
+
+        const oldTurn =
+            button.closest(
+                'article[data-testid^="conversation-turn-"], ' +
+                '[data-testid^="conversation-turn-"]'
+            );
+
+        if (
+            !oldTurn ||
+            !oldTurn.querySelector(
+                '[data-message-author-role="assistant"]'
+            )
+        ) {
             return null;
         }
+
         return oldTurn;
     }
 
     function isReplyCopyButton(button) {
         if (!button) return false;
 
-        /*
-         * 2026-09 新版回复级复制按钮：
-         *   .turn-action-controls button[aria-label="复制"]
-         *
-         * 限定 action bar，避免误把代码块内部的“复制”按钮当作回复复制。
-         */
-        const actionBar = button.closest('.turn-action-controls');
-        if (actionBar) {
-            const label = (button.getAttribute('aria-label') || '').trim().toLowerCase();
-            if (label === '复制' || label === 'copy') return true;
+        if (ACTIVE_ADAPTER.id === 'chatgpt') {
+            const actionBar =
+                button.closest('.turn-action-controls');
+
+            if (actionBar) {
+                const label =
+                    (
+                        button.getAttribute(
+                            'aria-label'
+                        ) ||
+                        ''
+                    )
+                        .trim()
+                        .toLowerCase();
+
+                if (
+                    label === '复制' ||
+                    label === 'copy'
+                ) {
+                    return true;
+                }
+            }
+
+            const testId =
+                button.getAttribute('data-testid') ||
+                '';
+
+            return (
+                testId.includes('action-bar-copy') ||
+                testId.includes('copy-turn') ||
+                Boolean(
+                    button.querySelector(
+                        'svg[data-testid*="copy"], ' +
+                        '[data-testid*="action-bar-copy"]'
+                    )
+                )
+            );
         }
 
-        // 旧版兼容。
-        const testId = button.getAttribute('data-testid') || '';
-        return testId.includes('action-bar-copy') ||
-            testId.includes('copy-turn') ||
-            Boolean(button.querySelector(
-                'svg[data-testid*="copy"], [data-testid*="action-bar-copy"]'
-            ));
+        if (
+            ACTIVE_ADAPTER.id === 'deepseek'
+        ) {
+            if (isCodeCopyButton(button)) {
+                return false;
+            }
+
+            return (
+                button.matches(
+                    'button.copy-btn'
+                ) ||
+                Boolean(
+                    button.querySelector(
+                        'svg[data-icon="copy"]'
+                    )
+                )
+            );
+        }
+
+        if (
+            ACTIVE_ADAPTER.id === 'doubao'
+        ) {
+            return Boolean(
+                !isCodeCopyButton(button) &&
+                button.matches(
+                    'button[data-testid="message_action_copy"]'
+                )
+            );
+        }
+
+        return false;
     }
 
     function collectFormulas(replyRoot) {
         if (!replyRoot) return [];
 
         const result = [];
-        const seen = new Set();
+        const seenContainers = new Set();
+        const candidates = [];
 
-        Array.from(replyRoot.querySelectorAll(FORMULA_CONTAINER_SELECTOR))
-            .forEach(container => {
-                const katex = container.querySelector(FORMULA_SELECTOR);
-                const latex = container.getAttribute('aria-label');
-                if (!katex || !latex || !latex.trim()) return;
+        if (
+            replyRoot instanceof Element &&
+            replyRoot.matches(
+                ACTIVE_ADAPTER.selectionSelector
+            )
+        ) {
+            candidates.push(replyRoot);
+        }
 
-                const key = container;
-                if (seen.has(key)) return;
-                seen.add(key);
+        candidates.push(
+            ...replyRoot.querySelectorAll(
+                ACTIVE_ADAPTER.selectionSelector
+            )
+        );
 
-                result.push({
-                    katex,
-                    container,
-                    latex: latex.trim(),
-                    display: Boolean(katex.closest('.katex-display')),
-                    visibleText: (katex.innerText || katex.textContent || '').trim()
-                });
-            });
+        for (const candidate of candidates) {
+            const info =
+                getFormulaInfo(candidate);
 
-        /*
-         * 如果当前 ChatGPT 又切回标准 KaTeX annotation，
-         * 仍然能够正常收集公式。
-         */
-        if (result.length === 0) {
-            Array.from(replyRoot.querySelectorAll(FORMULA_SELECTOR))
-                .forEach(katex => {
-                    const annotation = katex.querySelector(
-                        'annotation[encoding="application/x-tex"]'
-                    );
-                    if (!annotation || !annotation.textContent.trim()) return;
+            if (
+                !info ||
+                !info.container ||
+                !info.latex ||
+                seenContainers.has(info.container)
+            ) {
+                continue;
+            }
 
-                    result.push({
-                        katex,
-                        container: katex,
-                        latex: annotation.textContent.trim(),
-                        display: Boolean(katex.closest('.katex-display')),
-                        visibleText: (katex.innerText || katex.textContent || '').trim()
-                    });
-                });
+            seenContainers.add(info.container);
+            result.push(info);
         }
 
         return result;
     }
 
-    /*
-     * 选择复制：沿用“克隆选区 DOM -> 将公式替换为 LaTeX -> 写入纯文本”
-     * 这一在 AI网站公式复制Latex 中已验证可用的思路。
-     */
     function processSelectedFragment(fragment) {
-        const wrapper = document.createElement('div');
-        wrapper.appendChild(fragment.cloneNode(true));
+        const wrapper =
+            document.createElement('div');
 
-        const sourceContainers = Array.from(
-            wrapper.querySelectorAll(FORMULA_CONTAINER_SELECTOR)
+        wrapper.appendChild(
+            fragment.cloneNode(true)
         );
 
-        sourceContainers.forEach(container => {
-            const katex = container.querySelector(FORMULA_SELECTOR);
-            const latex = container.getAttribute('aria-label');
-            if (!katex || !latex || !latex.trim() || !container.parentNode) return;
-
-            const replacement = formatLatex({
-                latex: latex.trim(),
-                display: Boolean(katex.closest('.katex-display'))
-            });
-
-            container.parentNode.replaceChild(
-                document.createTextNode(replacement),
-                container
+        const candidates =
+            Array.from(
+                wrapper.querySelectorAll(
+                    ACTIVE_ADAPTER.selectionSelector
+                )
             );
-        });
 
-        /*
-         * 兼容标准 KaTeX annotation；前一步已经替换掉的公式
-         * 不会再出现在 wrapper 中，因此不会重复处理。
-         */
-        Array.from(wrapper.querySelectorAll(FORMULA_SELECTOR))
-            .forEach(katex => {
-                const annotation = katex.querySelector(
-                    'annotation[encoding="application/x-tex"]'
-                );
-                if (!annotation || !annotation.textContent.trim()) return;
+        const replaced =
+            new Set();
 
-                const target = katex.closest('.katex-display') || katex;
-                if (!target.parentNode) return;
+        for (const candidate of candidates) {
+            const info =
+                getFormulaInfo(candidate);
 
-                const replacement = formatLatex({
-                    latex: annotation.textContent.trim(),
-                    display: Boolean(katex.closest('.katex-display'))
-                });
+            if (
+                !info ||
+                !info.container ||
+                !info.container.parentNode ||
+                !wrapper.contains(info.container) ||
+                replaced.has(info.container)
+            ) {
+                continue;
+            }
 
-                target.parentNode.replaceChild(
-                    document.createTextNode(replacement),
-                    target
-                );
-            });
+            const replacement =
+                formatLatex(info);
 
-        return wrapper.textContent || '';
+            if (!replacement) {
+                continue;
+            }
+
+            info.container.parentNode.replaceChild(
+                document.createTextNode(
+                    replacement
+                ),
+                info.container
+            );
+
+            replaced.add(info.container);
+        }
+
+        return {
+            text:
+                wrapper.textContent ||
+                '',
+            formulaCount:
+                replaced.size
+        };
     }
 
     function handleSelectionCopy(event) {
-        const selection = window.getSelection();
-        if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+        const selection =
+            window.getSelection();
 
-        const range = selection.getRangeAt(0);
-        const fragment = range.cloneContents();
+        if (
+            !selection ||
+            selection.isCollapsed ||
+            selection.rangeCount === 0
+        ) {
+            return;
+        }
 
-        const probe = document.createElement('div');
-        probe.appendChild(fragment.cloneNode(true));
+        const range =
+            selection
+                .getRangeAt(0)
+                .cloneRange();
 
-        const hasFormula = Boolean(
-            probe.querySelector(FORMULA_CONTAINER_SELECTOR) ||
-            probe.querySelector(
-                '.katex, annotation[encoding="application/x-tex"]'
-            )
-        );
-        if (!hasFormula) return;
+        if (
+            ACTIVE_ADAPTER
+                .expandSelectionToFormula
+        ) {
+            const selector =
+                '.katex, .katex-html, ' +
+                '.math-inline, .math-display, ' +
+                '.math-block';
 
-        const processedText = processSelectedFragment(fragment);
-        if (!processedText) return;
+            const startElement =
+                elementFromNode(
+                    range.startContainer
+                );
+
+            const startFormula =
+                startElement &&
+                startElement.closest(
+                    selector
+                );
+
+            if (startFormula) {
+                range.setStartBefore(
+                    startFormula
+                );
+            }
+
+            const endElement =
+                elementFromNode(
+                    range.endContainer
+                );
+
+            const endFormula =
+                endElement &&
+                endElement.closest(
+                    selector
+                );
+
+            if (endFormula) {
+                range.setEndAfter(
+                    endFormula
+                );
+            }
+        }
+
+        const result =
+            processSelectedFragment(
+                range.cloneContents()
+            );
+
+        if (
+            !result.formulaCount ||
+            !result.text
+        ) {
+            return;
+        }
 
         event.preventDefault();
         event.stopPropagation();
 
+        if (
+            ACTIVE_ADAPTER
+                .stopImmediateOnSelection
+        ) {
+            event.stopImmediatePropagation();
+        }
+
         if (event.clipboardData) {
-            event.clipboardData.setData('text/plain', processedText);
-            showToast('已格式化选中的公式内容', false);
+            event.clipboardData.setData(
+                'text/plain',
+                result.text
+            );
+
+            showToast(
+                `已格式化选中的 ${result.formulaCount} 个公式`,
+                false
+            );
+
             return;
         }
 
-        copyText(processedText).then(copied => {
+        copyText(
+            result.text
+        ).then(copied => {
             showToast(
-                copied ? '已格式化选中的公式内容' : '选择复制失败',
+                copied
+                    ? `已格式化选中的 ${result.formulaCount} 个公式`
+                    : '选择复制失败',
                 !copied
             );
         });
@@ -558,60 +1138,181 @@
         return repaired;
     }
 
-    async function repairClipboardAfterReplyCopy(button) {
-        const replyRoot = getAssistantReplyRoot(button);
-        const formulas = collectFormulas(replyRoot);
-        if (formulas.length === 0) return;
+    function normalizeCopiedDelimiters(text) {
+        if (typeof text !== 'string') {
+            return text;
+        }
 
-        /*
-         * 让 ChatGPT 先完成它自己的复制，再读取并修复本次剪贴板。
-         * 原 GreasyFork 脚本也采用“按钮点击后延时读取剪贴板”的策略；
-         * 这里额外利用 DOM 中的真实公式源码来恢复 () / [] 定界符。
-         */
-        await new Promise(resolve => setTimeout(resolve, 120));
+        let modified = text;
+
+        modified = modified.replace(
+            /\$\$(.*?)\$\$/gs,
+            (_, formula) =>
+                `\n$$\n${formula.trim()}\n$$\n`
+        );
+
+        modified = modified.replace(
+            /\\\[(.*?)\\\]/gs,
+            (_, formula) =>
+                `\n$$\n${formula.trim()}\n$$\n`
+        );
+
+        modified = modified.replace(
+            /\\\((.*?)\\\)/gs,
+            (_, formula) =>
+                `$${formula.trim()}$`
+        );
+
+        return modified;
+    }
+
+    async function repairClipboardAfterReplyCopy(button) {
+        await new Promise(
+            resolve =>
+                setTimeout(resolve, 120)
+        );
 
         try {
-            if (!navigator.clipboard || !navigator.clipboard.readText) {
-                throw new Error('Clipboard readText API unavailable');
+            if (
+                !navigator.clipboard ||
+                !navigator.clipboard.readText
+            ) {
+                throw new Error(
+                    'Clipboard readText API unavailable'
+                );
             }
 
-            const originalText = await navigator.clipboard.readText();
-            const repairedText = repairCopiedReply(originalText, formulas);
+            const originalText =
+                await navigator.clipboard.readText();
 
-            if (repairedText === originalText) {
-                showToast('未检测到需要修复的公式', false);
+            let repairedText =
+                originalText;
+
+            let formulaCount =
+                0;
+
+            if (
+                ACTIVE_ADAPTER.replyCopyMode ===
+                'chatgpt'
+            ) {
+                const label =
+                    (
+                        button.getAttribute(
+                            'aria-label'
+                        ) ||
+                        ''
+                    )
+                        .trim()
+                        .toLowerCase();
+
+                if (
+                    label === '复制消息' ||
+                    label === 'copy message'
+                ) {
+                    return;
+                }
+
+                const replyRoot =
+                    getAssistantReplyRoot(
+                        button
+                    );
+
+                const formulas =
+                    collectFormulas(
+                        replyRoot
+                    );
+
+                formulaCount =
+                    formulas.length;
+
+                if (!formulaCount) {
+                    return;
+                }
+
+                repairedText =
+                    repairCopiedReply(
+                        originalText,
+                        formulas
+                    );
+            } else if (
+                ACTIVE_ADAPTER.replyCopyMode ===
+                'normalize'
+            ) {
+                repairedText =
+                    normalizeCopiedDelimiters(
+                        originalText
+                    );
+            } else {
                 return;
             }
 
-            const copied = await copyText(repairedText);
+            if (
+                repairedText ===
+                originalText
+            ) {
+                return;
+            }
+
+            const copied =
+                await copyText(
+                    repairedText
+                );
+
             showToast(
                 copied
-                    ? `已修复回复中的 ${formulas.length} 个公式`
+                    ? (
+                        formulaCount
+                            ? `已修复回复中的 ${formulaCount} 个公式`
+                            : '已格式化复制内容'
+                    )
                     : '公式修复后写回剪贴板失败',
                 !copied
             );
         } catch (error) {
-            console.error('[ChatGPT LaTeX] 回复复制修复失败:', error);
-            showToast('回复复制后处理失败，请查看控制台', true);
+            console.error(
+                `[AI LaTeX][${ACTIVE_ADAPTER.name}] 复制后处理失败:`,
+                error
+            );
+
+            showToast(
+                '复制后处理失败，请查看控制台',
+                true
+            );
         }
     }
 
     function handleReplyCopy(event) {
-        const target = event.target instanceof Element
-            ? event.target
-            : event.target && event.target.parentElement;
-        const button = target && target.closest('button');
-        if (!isReplyCopyButton(button)) return;
+        if (
+            !ACTIVE_ADAPTER.replyCopyMode
+        ) {
+            return;
+        }
 
-        /*
-         * 新版 ChatGPT 的用户消息复制按钮 aria-label 为“复制消息”，
-         * assistant 回复按钮为“复制”。这里只处理后者。
-         */
-        const label = (button.getAttribute('aria-label') || '').trim().toLowerCase();
-        if (label === '复制消息' || label === 'copy message') return;
+        const target =
+            elementFromNode(
+                event.target
+            );
 
-        void repairClipboardAfterReplyCopy(button);
+        const button =
+            target &&
+            target.closest(
+                'button'
+            );
+
+        if (
+            !isReplyCopyButton(
+                button
+            )
+        ) {
+            return;
+        }
+
+        void repairClipboardAfterReplyCopy(
+            button
+        );
     }
+
+    console.info(`[AI LaTeX] 已启用 ${ACTIVE_ADAPTER.name} 适配器`);
 
     document.addEventListener('mouseover', handleFormulaHover, true);
     document.addEventListener('mouseout', handleFormulaLeave, true);
