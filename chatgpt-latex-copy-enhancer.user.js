@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0
+// @version      3.0.1
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站提供公式悬浮预览、单公式复制、选择复制和复制按钮修复
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -782,20 +782,61 @@
         if (
             ACTIVE_ADAPTER.id === 'deepseek'
         ) {
-            if (isCodeCopyButton(button)) {
+            if (
+                isCodeCopyButton(button) ||
+                button.closest(
+                    '.ds-markdown-code-copy-button'
+                )
+            ) {
                 return false;
             }
 
-            return (
+            const semanticText = [
+                button.getAttribute('aria-label'),
+                button.getAttribute('title'),
+                button.getAttribute('data-tooltip'),
+                button.getAttribute('data-tooltip-content'),
+                button.getAttribute('data-testid'),
+                button.textContent,
+                button.className
+            ]
+                .filter(value => typeof value === 'string')
+                .join(' ')
+                .toLowerCase();
+
+            if (
+                semanticText.includes('copy') ||
+                semanticText.includes('复制')
+            ) {
+                return true;
+            }
+
+            if (
                 button.matches(
-                    'button.copy-btn'
+                    'button.copy-btn, .copy-btn'
                 ) ||
-                Boolean(
-                    button.querySelector(
-                        'svg[data-icon="copy"]'
-                    )
+                button.querySelector(
+                    'svg[data-icon="copy"], ' +
+                    '[data-testid*="copy"], ' +
+                    '[aria-label*="copy" i], ' +
+                    '[title*="copy" i]'
                 )
+            ) {
+                return true;
+            }
+
+            /*
+             * DeepSeek 当前网页的消息操作项通常不是 <button>，
+             * 而是 .ds-icon-button。复制图标使用 20x20 SVG。
+             * 这里用复制图标 path 作为最后一道识别，而不是把
+             * 所有 .ds-icon-button 都当成复制按钮。
+             */
+            const copyIconPath = button.querySelector(
+                'svg[viewBox="0 0 20 20"] ' +
+                'path[d^="M5 14H4V5h9v1"]'
             );
+
+            return Boolean(copyIconPath);
         }
 
         if (
@@ -1346,7 +1387,9 @@
         const button =
             target &&
             target.closest(
-                'button'
+                ACTIVE_ADAPTER.id === 'deepseek'
+                    ? 'button, [role="button"], .ds-icon-button'
+                    : 'button'
             );
 
         if (
