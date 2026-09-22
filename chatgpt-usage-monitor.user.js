@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 用量监视器
 // @namespace    https://tampermonkey.net/
-// @version      1.2.0
+// @version      1.2.1
 // @description  在 ChatGPT 页面内显示用量、订阅周期和 PoW 风险提示，无需手工维护 Bearer Token
 // @author       Liu Baoding
 // @match        https://chatgpt.com/*
@@ -9,7 +9,7 @@
 // @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-usage-monitor.user.js
 // @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-usage-monitor.user.js
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-start
 // @noframes
 // ==/UserScript==
 
@@ -36,11 +36,18 @@
     const INITIAL_REFRESH_DELAY_MS = 1200;
     const INITIAL_RETRY_DELAYS_MS = [1500, 3000, 6000];
     const BACKGROUND_REFRESH_MS = 5 * 60 * 1000;
+    const PASSIVE_CACHE_MS = 30 * 1000;
 
     let lastLoadedAt = 0;
     let lastRawData = null;
     let lastPowInfo = loadPowInfo();
     let loading = false;
+
+    const observedResponses = {
+        usage: null,
+        resetCredits: null,
+        accountsCheck: null,
+    };
 
     function escapeHtml(value) {
         return String(value ?? '').replace(/[&<>'"]/g, char => ({
@@ -93,7 +100,7 @@
             return {
                 key: 'unknown',
                 label: '未知',
-                workLabel: '—',
+                solveLabel: '—',
                 color: '#8b8b8b',
                 hexLength: 0,
             };
@@ -108,7 +115,7 @@
             return {
                 key: 'high',
                 label: '高风险',
-                workLabel: '困难',
+                solveLabel: '高',
                 color: '#dc4c43',
                 hexLength,
             };
@@ -118,7 +125,7 @@
             return {
                 key: 'medium',
                 label: '中风险',
-                workLabel: '中等',
+                solveLabel: '中等',
                 color: '#d99a20',
                 hexLength,
             };
@@ -128,7 +135,7 @@
             return {
                 key: 'low',
                 label: '低风险',
-                workLabel: '简单',
+                solveLabel: '较低',
                 color: '#7a9f2b',
                 hexLength,
             };
@@ -137,7 +144,7 @@
         return {
             key: 'normal',
             label: '正常',
-            workLabel: '极易',
+            solveLabel: '很低',
             color: '#10a37f',
             hexLength,
         };
@@ -177,6 +184,43 @@
         return SENTINEL_PATHS.some(path => url.includes(path));
     }
 
+    function classifyObservedEndpoint(resource, options) {
+        const url = getFetchUrl(resource);
+        if (!url) return '';
+
+        const method = getFetchMethod(resource, options);
+        if (method !== 'GET') return '';
+
+        if (url.includes(USAGE_URL)) return 'usage';
+        if (url.includes(RESET_CREDITS_URL)) return 'resetCredits';
+        if (url.includes(ACCOUNTS_CHECK_URL)) return 'accountsCheck';
+
+        return '';
+    }
+
+    function cacheObservedResponse(key, data) {
+        if (!key || !data) return;
+
+        observedResponses[key] = {
+            data,
+            capturedAt: Date.now(),
+        };
+    }
+
+    function getFreshObserved(key) {
+        const entry = observedResponses[key];
+        if (!entry) return null;
+
+        if (
+            Date.now() - entry.capturedAt >
+            PASSIVE_CACHE_MS
+        ) {
+            return null;
+        }
+
+        return entry.data;
+    }
+
     function capturePowResponse(data) {
         const pow = data?.proofofwork;
         if (!pow || typeof pow !== 'object') return;
@@ -199,24 +243,58 @@
         });
     }
 
-    function installSentinelObserver() {
+    function installNetworkObserver() {
         const currentFetch = window.fetch;
         if (
             typeof currentFetch !== 'function' ||
-            currentFetch.__cumSentinelObserver
+            currentFetch.__cumNetworkObserver
         ) {
             return;
         }
 
         const wrappedFetch = async function (resource, options) {
-            const response = await currentFetch.apply(this, arguments);
+            const response =
+                await currentFetch.apply(
+                    this,
+                    arguments
+                );
 
-            if (isSentinelRequest(resource, options)) {
+            const observedKey =
+                classifyObservedEndpoint(
+                    resource,
+                    options
+                );
+
+            if (
+                observedKey ||
+                isSentinelRequest(
+                    resource,
+                    options
+                )
+            ) {
                 try {
                     response
                         .clone()
                         .json()
-                        .then(capturePowResponse)
+                        .then(data => {
+                            if (observedKey) {
+                                cacheObservedResponse(
+                                    observedKey,
+                                    data
+                                );
+                            }
+
+                            if (
+                                isSentinelRequest(
+                                    resource,
+                                    options
+                                )
+                            ) {
+                                capturePowResponse(
+                                    data
+                                );
+                            }
+                        })
                         .catch(() => {});
                 } catch (_) {
                     // Never interfere with ChatGPT's own request lifecycle.
@@ -229,7 +307,7 @@
         try {
             Object.defineProperty(
                 wrappedFetch,
-                '__cumSentinelObserver',
+                '__cumNetworkObserver',
                 { value: true }
             );
         } catch (_) {
@@ -439,38 +517,121 @@
         return response.json();
     }
 
-    async function queryUsage() {
-        const auth = await readSession();
+    async function queryUsage(options = {}) {
+        const {
+            forceNetwork = false,
+        } = options;
 
-        const [usageResult, resetResult, accountsResult] = await Promise.allSettled([
-            fetchJson(USAGE_URL, auth),
-            fetchJson(RESET_CREDITS_URL, auth),
-            fetchJson(ACCOUNTS_CHECK_URL, auth),
-        ]);
+        let usage =
+            forceNetwork
+                ? null
+                : getFreshObserved('usage');
 
-        if (usageResult.status === 'rejected') {
-            throw usageResult.reason;
+        let resetCredits =
+            forceNetwork
+                ? null
+                : getFreshObserved(
+                    'resetCredits'
+                );
+
+        let accountsCheck =
+            forceNetwork
+                ? null
+                : getFreshObserved(
+                    'accountsCheck'
+                );
+
+        let resetCreditsError = '';
+        let accountsCheckError = '';
+        let accountId =
+            lastRawData?.accountId ||
+            '';
+
+        /*
+         * 优先复用网页自己刚刚请求到的数据。
+         * 缺少任何一项时，再读取 session 并只补发缺失的 GET。
+         * 因此“被动监听”是优化层，不是可靠性的单点依赖。
+         */
+        if (
+            !usage ||
+            !resetCredits ||
+            !accountsCheck
+        ) {
+            const auth =
+                await readSession();
+
+            accountId =
+                auth.accountId;
+
+            const requests = [];
+
+            if (!usage) {
+                requests.push(
+                    fetchJson(
+                        USAGE_URL,
+                        auth
+                    ).then(value => {
+                        usage = value;
+                    })
+                );
+            }
+
+            if (!resetCredits) {
+                requests.push(
+                    fetchJson(
+                        RESET_CREDITS_URL,
+                        auth
+                    )
+                        .then(value => {
+                            resetCredits = value;
+                        })
+                        .catch(error => {
+                            resetCreditsError =
+                                String(
+                                    error?.message ||
+                                    error ||
+                                    '请求失败'
+                                );
+                        })
+                );
+            }
+
+            if (!accountsCheck) {
+                requests.push(
+                    fetchJson(
+                        ACCOUNTS_CHECK_URL,
+                        auth
+                    )
+                        .then(value => {
+                            accountsCheck = value;
+                        })
+                        .catch(error => {
+                            accountsCheckError =
+                                String(
+                                    error?.message ||
+                                    error ||
+                                    '请求失败'
+                                );
+                        })
+                );
+            }
+
+            await Promise.all(requests);
+        }
+
+        if (!usage) {
+            throw new Error(
+                '未能取得 ChatGPT 用量数据'
+            );
         }
 
         return {
-            usage: usageResult.value,
-            resetCredits:
-                resetResult.status === 'fulfilled'
-                    ? resetResult.value
-                    : null,
-            resetCreditsError:
-                resetResult.status === 'rejected'
-                    ? String(resetResult.reason?.message || resetResult.reason || '请求失败')
-                    : '',
-            accountsCheck:
-                accountsResult.status === 'fulfilled'
-                    ? accountsResult.value
-                    : null,
-            accountsCheckError:
-                accountsResult.status === 'rejected'
-                    ? String(accountsResult.reason?.message || accountsResult.reason || '请求失败')
-                    : '',
-            accountId: auth.accountId,
+            usage,
+            resetCredits,
+            resetCreditsError,
+            accountsCheck,
+            accountsCheckError,
+            accountId,
         };
     }
 
@@ -588,11 +749,13 @@
             }
 
             #cum-panel {
-                position: absolute;
-                right: 64px;
-                bottom: 0;
-                width: min(400px, calc(100vw - 96px));
-                max-height: min(690px, calc(100vh - 64px));
+                position: fixed;
+                right: 84px;
+                top: 50%;
+                bottom: auto;
+                transform: translateY(-50%);
+                width: min(400px, calc(100vw - 112px));
+                max-height: min(690px, calc(100vh - 32px));
                 display: none;
                 flex-direction: column;
                 overflow: hidden;
@@ -846,10 +1009,12 @@
                 }
 
                 #cum-panel {
-                    right: 0;
-                    bottom: 116px;
+                    right: 10px;
+                    top: 12px;
+                    bottom: auto;
+                    transform: none;
                     width: calc(100vw - 20px);
-                    max-height: calc(100vh - 150px);
+                    max-height: calc(100vh - 24px);
                 }
 
                 .cum-limit-ring {
@@ -943,7 +1108,9 @@
         });
 
         refresh.addEventListener('click', () => {
-            void refreshUsage();
+            void refreshUsage({
+                forceNetwork: true,
+            });
         });
 
         close.addEventListener('click', () => {
@@ -1071,8 +1238,13 @@
                 </div>
 
                 <div class="cum-detail-row">
-                    <span>PoW 难度</span>
-                    <span>${escapeHtml(lastPowInfo.difficulty)} · ${escapeHtml(risk.workLabel)}</span>
+                    <span>difficulty 原值</span>
+                    <span>${escapeHtml(lastPowInfo.difficulty)}</span>
+                </div>
+
+                <div class="cum-detail-row">
+                    <span>PoW 求解难度</span>
+                    <span>${escapeHtml(risk.solveLabel)}</span>
                 </div>
 
                 <div class="cum-detail-row">
@@ -1095,7 +1267,7 @@
                 </div>
 
                 <div class="cum-pow-note">
-                    该风险等级沿用社区插件的启发式规则：去掉前导 0 后，difficulty 的十六进制位数越少，通常意味着要求的 PoW 越困难。它只能作为 Sentinel 风控信号参考，不能单独证明模型发生了“降智”或路由降级。
+                    “PoW 求解难度”只表示 Sentinel challenge 所需计算工作量，不是模型推理难度。这里沿用社区插件的启发式规则：去掉前导 0 后，difficulty 的十六进制位数越少，通常意味着 PoW 越难、风控信号越强。该指标不能单独证明模型发生了“降智”或路由降级。
                 </div>
             </div>
         `;
@@ -1442,13 +1614,17 @@
 
         const {
             showError = true,
+            forceNetwork = false,
         } = options;
 
         loading = true;
         renderLoading();
 
         try {
-            const data = await queryUsage();
+            const data =
+                await queryUsage({
+                    forceNetwork,
+                });
             lastRawData = data;
             lastLoadedAt = Date.now();
             renderData(data);
@@ -1529,7 +1705,7 @@
     }
 
     function init() {
-        installSentinelObserver();
+        installNetworkObserver();
         injectStyle();
 
         if (document.body) {
