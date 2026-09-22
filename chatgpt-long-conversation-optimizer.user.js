@@ -6,8 +6,8 @@
 // @author       you
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
-// @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-long-conversation-optimizer/main/chatgpt-long-conversation-optimizer.user.js
-// @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-long-conversation-optimizer/main/chatgpt-long-conversation-optimizer.user.js
+// @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-long-conversation-optimizer.user.js
+// @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-long-conversation-optimizer.user.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
