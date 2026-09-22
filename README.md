@@ -78,6 +78,7 @@ https://chat.openai.com/*
   - 当前使用状态
   - 当前订阅套餐与状态
   - 自动续费状态及当前订阅周期节点
+  - PoW difficulty、Persona 与风险提示
   - 积分余额、消费控制等辅助信息
   - 原始 JSON
 - Token 只保存在当前页面 JS 内存中，不写入：
@@ -85,9 +86,13 @@ https://chat.openai.com/*
   - Tampermonkey 存储
   - 本地文件
 - 若请求返回 401/403，会重新读取当前登录会话并自动重试一次。
-- 页面右下角提供轻量用量入口，点击后展开详情面板。
-- 页面刷新后会自动获取一次用量，使最小化胶囊直接显示当前状态。
+- 页面右侧输入区外侧使用两个竖排圆环显示 5 小时 / 周限额剩余比例，避免横向胶囊遮挡输入框。
+- 点击圆环后展开详情面板。
+- 页面刷新后会自动获取一次用量，使圆环直接显示当前状态。
 - 页面保持打开时约每 5 分钟后台刷新一次；从后台切回且数据已过期时也会自动刷新。
+- 被动监听 ChatGPT 自身的 Sentinel `chat-requirements` / `prepare` 响应，提取 `proofofwork.difficulty`；不会为了检测而主动重复发送 Sentinel prepare 请求。
+- PoW 仅在当前标签页 `sessionStorage` 保存 `difficulty`、`persona` 和采样时间，不保存 `prepare_token`、`seed`、Turnstile / `dx` 等 challenge 数据。
+- PoW 风险等级采用社区工具的启发式规则：去掉前导 0 后，有效十六进制位数 `<=2 / 3 / 4 / >=5` 分别显示为高风险 / 中风险 / 低风险 / 正常。该指标只作为 Sentinel 风控信号参考，并不能单独证明实际模型发生降级。
 
 ### 说明
 
@@ -107,13 +112,7 @@ https://chat.openai.com/*
 
 ## 开发与测试
 
-当前兼容新版 ChatGPT DOM 的改动位于：
-
-```text
-fix/chatgpt-2026-09-dom
-```
-
-测试通过后合并到 `main`。
+功能修改通常先在独立 feature branch / Draft PR 中验证，通过实际页面测试后再合并到 `main`。
 
 ## 适用页面
 
