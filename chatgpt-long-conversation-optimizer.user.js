@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ChatGPT 消息限高 + 离屏渲染休眠（纯净版）
+// @name         ChatGPT 长对话性能优化器
 // @namespace    https://tampermonkey.net/
-// @version      4.0.0
-// @description  仅保留用户/助手消息限高和离屏渲染优化，不处理公式、剪贴板、表格或对话折叠
+// @version      4.1.0
+// @description  兼容新版 ChatGPT DOM 的用户/助手消息限高，并在旧版结构上保留离屏渲染优化
 // @author       you
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -50,6 +50,28 @@
 
     renderSleep:
       '__conversation_render_sleep_enabled__',
+  };
+
+  /*
+   * 同时兼容旧版与 2026-09 新版 ChatGPT DOM。
+   *
+   * 新版：
+   *   [data-content-search-unit-key$=":assistant"]
+   *     [data-markdown-text-style="assistant-message"]
+   *
+   *   [data-content-search-unit-key$=":user"]
+   *     [data-user-message-bubble="true"]
+   */
+  const MESSAGE_SELECTOR = {
+    assistant: [
+      '[data-message-author-role="assistant"]',
+      '[data-content-search-unit-key$=":assistant"] [data-markdown-text-style="assistant-message"]',
+    ].join(', '),
+
+    user: [
+      '[data-message-author-role="user"]',
+      '[data-content-search-unit-key$=":user"] [data-user-message-bubble="true"]',
+    ].join(', '),
   };
 
   function readBoolean(key, fallback) {
@@ -172,7 +194,7 @@
        * 只限制纵向高度，不修改公式、表格或 DOM。
        */
       html.${ROOT_CLASS.assistantHeight}
-      [data-message-author-role="assistant"] {
+      :is(${MESSAGE_SELECTOR.assistant}) {
         max-height:
           var(
             --assistant-max-height,
@@ -209,7 +231,7 @@
        * 适用于包含大量附件的用户消息。
        */
       html.${ROOT_CLASS.userHeight}
-      [data-message-author-role="user"] {
+      :is(${MESSAGE_SELECTOR.user}) {
         max-height:
           var(
             --user-max-height,
@@ -244,10 +266,10 @@
        * Chromium / Edge 滚动条。
        */
       html.${ROOT_CLASS.assistantHeight}
-      [data-message-author-role="assistant"]::-webkit-scrollbar,
+      :is(${MESSAGE_SELECTOR.assistant})::-webkit-scrollbar,
 
       html.${ROOT_CLASS.userHeight}
-      [data-message-author-role="user"]::-webkit-scrollbar {
+      :is(${MESSAGE_SELECTOR.user})::-webkit-scrollbar {
         display:
           block !important;
 
@@ -259,10 +281,10 @@
       }
 
       html.${ROOT_CLASS.assistantHeight}
-      [data-message-author-role="assistant"]::-webkit-scrollbar-track,
+      :is(${MESSAGE_SELECTOR.assistant})::-webkit-scrollbar-track,
 
       html.${ROOT_CLASS.userHeight}
-      [data-message-author-role="user"]::-webkit-scrollbar-track {
+      :is(${MESSAGE_SELECTOR.user})::-webkit-scrollbar-track {
         background:
           var(
             --bg-token-surface-secondary,
@@ -274,10 +296,10 @@
       }
 
       html.${ROOT_CLASS.assistantHeight}
-      [data-message-author-role="assistant"]::-webkit-scrollbar-thumb,
+      :is(${MESSAGE_SELECTOR.assistant})::-webkit-scrollbar-thumb,
 
       html.${ROOT_CLASS.userHeight}
-      [data-message-author-role="user"]::-webkit-scrollbar-thumb {
+      :is(${MESSAGE_SELECTOR.user})::-webkit-scrollbar-thumb {
         background:
           var(
             --text-token-text-tertiary,
@@ -295,10 +317,10 @@
       }
 
       html.${ROOT_CLASS.assistantHeight}
-      [data-message-author-role="assistant"]::-webkit-scrollbar-thumb:hover,
+      :is(${MESSAGE_SELECTOR.assistant})::-webkit-scrollbar-thumb:hover,
 
       html.${ROOT_CLASS.userHeight}
-      [data-message-author-role="user"]::-webkit-scrollbar-thumb:hover {
+      :is(${MESSAGE_SELECTOR.user})::-webkit-scrollbar-thumb:hover {
         background:
           var(
             --text-token-text-secondary,
@@ -313,19 +335,20 @@
       }
 
       html.${ROOT_CLASS.assistantHeight}
-      [data-message-author-role="assistant"]::-webkit-scrollbar-corner,
+      :is(${MESSAGE_SELECTOR.assistant})::-webkit-scrollbar-corner,
 
       html.${ROOT_CLASS.userHeight}
-      [data-message-author-role="user"]::-webkit-scrollbar-corner {
+      :is(${MESSAGE_SELECTOR.user})::-webkit-scrollbar-corner {
         background:
           transparent !important;
       }
 
       /*
-       * 离屏渲染休眠。
+       * 离屏渲染休眠（仅旧版 DOM）。
        *
-       * 不删除、不移动、不隐藏 DOM。
-       * 仅允许浏览器跳过离屏子树的布局和绘制。
+       * 2026-09 新版 ChatGPT 已使用 [data-turn-key] + 显式高度占位
+       * 进行官方虚拟化。这里不对新版虚拟列表追加 content-visibility，
+       * 避免与官方高度测量发生冲突。
        */
       html.${ROOT_CLASS.renderSleep}
       #thread
