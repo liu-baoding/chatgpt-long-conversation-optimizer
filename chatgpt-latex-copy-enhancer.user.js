@@ -1,10 +1,14 @@
 // ==UserScript==
-// @name         ChatGPT LaTeX 悬浮预览 + 复制修复
+// @name         ChatGPT LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      1.0.2
-// @description  为 ChatGPT 公式提供悬浮 LaTeX 预览、单公式复制和回复复制修复
+// @version      2.0.0
+// @description  为 ChatGPT 提供公式悬浮预览、单公式复制、选择复制和回复复制按钮修复
+// @license      MIT
+// @author       Liu Baoding; selection-copy strategy adapted from fanxing's AI网站公式复制Latex (MIT)
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
+// @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-latex-copy-enhancer.user.js
+// @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-latex-copy-enhancer.user.js
 // @grant        none
 // ==/UserScript==
 
@@ -14,7 +18,7 @@
     if (window.__chatgptLatexEnhancerLoaded) return;
     window.__chatgptLatexEnhancerLoaded = true;
 
-    const FORMULA_CONTAINER_SELECTOR = '[data-client-katex-layout][aria-label]';
+    const FORMULA_CONTAINER_SELECTOR = '[data-client-katex-layout][aria-label], [data-markdown-copy="math"][aria-label]';
     const FORMULA_SELECTOR = '.katex';
     const HOVER_CLASS = 'chatgpt-latex-hover';
     let activeFormulaContainer = null;
@@ -80,14 +84,19 @@
     function getFormulaInfo(node) {
         const element = node instanceof Element ? node : node && node.parentElement;
         const katex = element && element.closest(FORMULA_SELECTOR);
-        const container = katex && katex.closest(FORMULA_CONTAINER_SELECTOR);
-        const latex = container && container.getAttribute('aria-label');
+        if (!katex) return null;
 
-        if (!katex || !container || !latex || !latex.trim()) return null;
+        const container = katex.closest(FORMULA_CONTAINER_SELECTOR);
+        const annotation = katex.querySelector('annotation[encoding="application/x-tex"]');
+        const latex =
+            (container && container.getAttribute('aria-label')) ||
+            (annotation && annotation.textContent);
+
+        if (!latex || !latex.trim()) return null;
 
         return {
             katex,
-            container,
+            container: container || katex,
             latex: latex.trim(),
             display: Boolean(katex.closest('.katex-display')),
             visibleText: (katex.innerText || katex.textContent || '').trim()
@@ -175,37 +184,211 @@
     }
 
     function getAssistantReplyRoot(button) {
+        if (!button) return null;
+
+        /*
+         * 2026-09 新版 ChatGPT：
+         * assistant 的回复正文和 action bar 位于同一个 :assistant unit 内。
+         */
+        const directAssistant = button.closest(
+            '[data-content-search-unit-key$=":assistant"]'
+        );
+        if (directAssistant) return directAssistant;
+
+        const turn = button.closest('[data-turn-key]');
+        if (turn) {
+            const assistantUnit = turn.querySelector(
+                '[data-content-search-unit-key$=":assistant"]'
+            );
+            if (assistantUnit) return assistantUnit;
+
+            const markdown = turn.querySelector(
+                '[data-markdown-text-style="assistant-message"]'
+            );
+            if (markdown) {
+                return markdown.closest('[data-content-search-unit-key]') || markdown;
+            }
+        }
+
+        // 旧版兼容。
         const directMessage = button.closest('[data-message-author-role="assistant"]');
         if (directMessage) return directMessage;
 
-        const turn = button.closest('article[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"]');
-        if (!turn || !turn.querySelector('[data-message-author-role="assistant"]')) return null;
-        return turn;
+        const oldTurn = button.closest(
+            'article[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"]'
+        );
+        if (!oldTurn || !oldTurn.querySelector('[data-message-author-role="assistant"]')) {
+            return null;
+        }
+        return oldTurn;
     }
 
     function isReplyCopyButton(button) {
         if (!button) return false;
+
+        /*
+         * 2026-09 新版回复级复制按钮：
+         *   .turn-action-controls button[aria-label="复制"]
+         *
+         * 限定 action bar，避免误把代码块内部的“复制”按钮当作回复复制。
+         */
+        const actionBar = button.closest('.turn-action-controls');
+        if (actionBar) {
+            const label = (button.getAttribute('aria-label') || '').trim().toLowerCase();
+            if (label === '复制' || label === 'copy') return true;
+        }
+
+        // 旧版兼容。
         const testId = button.getAttribute('data-testid') || '';
         return testId.includes('action-bar-copy') ||
             testId.includes('copy-turn') ||
-            Boolean(button.querySelector('svg[data-testid*="copy"], [data-testid*="action-bar-copy"]'));
+            Boolean(button.querySelector(
+                'svg[data-testid*="copy"], [data-testid*="action-bar-copy"]'
+            ));
     }
 
     function collectFormulas(replyRoot) {
-        return Array.from(replyRoot.querySelectorAll(FORMULA_CONTAINER_SELECTOR))
-            .map(container => {
+        if (!replyRoot) return [];
+
+        const result = [];
+        const seen = new Set();
+
+        Array.from(replyRoot.querySelectorAll(FORMULA_CONTAINER_SELECTOR))
+            .forEach(container => {
                 const katex = container.querySelector(FORMULA_SELECTOR);
                 const latex = container.getAttribute('aria-label');
-                if (!katex || !latex || !latex.trim()) return null;
-                return {
+                if (!katex || !latex || !latex.trim()) return;
+
+                const key = container;
+                if (seen.has(key)) return;
+                seen.add(key);
+
+                result.push({
                     katex,
                     container,
                     latex: latex.trim(),
                     display: Boolean(katex.closest('.katex-display')),
                     visibleText: (katex.innerText || katex.textContent || '').trim()
-                };
-            })
-            .filter(Boolean);
+                });
+            });
+
+        /*
+         * 如果当前 ChatGPT 又切回标准 KaTeX annotation，
+         * 仍然能够正常收集公式。
+         */
+        if (result.length === 0) {
+            Array.from(replyRoot.querySelectorAll(FORMULA_SELECTOR))
+                .forEach(katex => {
+                    const annotation = katex.querySelector(
+                        'annotation[encoding="application/x-tex"]'
+                    );
+                    if (!annotation || !annotation.textContent.trim()) return;
+
+                    result.push({
+                        katex,
+                        container: katex,
+                        latex: annotation.textContent.trim(),
+                        display: Boolean(katex.closest('.katex-display')),
+                        visibleText: (katex.innerText || katex.textContent || '').trim()
+                    });
+                });
+        }
+
+        return result;
+    }
+
+    /*
+     * 选择复制：沿用“克隆选区 DOM -> 将公式替换为 LaTeX -> 写入纯文本”
+     * 这一在 AI网站公式复制Latex 中已验证可用的思路。
+     */
+    function processSelectedFragment(fragment) {
+        const wrapper = document.createElement('div');
+        wrapper.appendChild(fragment.cloneNode(true));
+
+        const sourceContainers = Array.from(
+            wrapper.querySelectorAll(FORMULA_CONTAINER_SELECTOR)
+        );
+
+        sourceContainers.forEach(container => {
+            const katex = container.querySelector(FORMULA_SELECTOR);
+            const latex = container.getAttribute('aria-label');
+            if (!katex || !latex || !latex.trim() || !container.parentNode) return;
+
+            const replacement = formatLatex({
+                latex: latex.trim(),
+                display: Boolean(katex.closest('.katex-display'))
+            });
+
+            container.parentNode.replaceChild(
+                document.createTextNode(replacement),
+                container
+            );
+        });
+
+        /*
+         * 兼容标准 KaTeX annotation；前一步已经替换掉的公式
+         * 不会再出现在 wrapper 中，因此不会重复处理。
+         */
+        Array.from(wrapper.querySelectorAll(FORMULA_SELECTOR))
+            .forEach(katex => {
+                const annotation = katex.querySelector(
+                    'annotation[encoding="application/x-tex"]'
+                );
+                if (!annotation || !annotation.textContent.trim()) return;
+
+                const target = katex.closest('.katex-display') || katex;
+                if (!target.parentNode) return;
+
+                const replacement = formatLatex({
+                    latex: annotation.textContent.trim(),
+                    display: Boolean(katex.closest('.katex-display'))
+                });
+
+                target.parentNode.replaceChild(
+                    document.createTextNode(replacement),
+                    target
+                );
+            });
+
+        return wrapper.textContent || '';
+    }
+
+    function handleSelectionCopy(event) {
+        const selection = window.getSelection();
+        if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+
+        const range = selection.getRangeAt(0);
+        const fragment = range.cloneContents();
+
+        const probe = document.createElement('div');
+        probe.appendChild(fragment.cloneNode(true));
+
+        const hasFormula = Boolean(
+            probe.querySelector(FORMULA_CONTAINER_SELECTOR) ||
+            probe.querySelector(
+                '.katex, annotation[encoding="application/x-tex"]'
+            )
+        );
+        if (!hasFormula) return;
+
+        const processedText = processSelectedFragment(fragment);
+        if (!processedText) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (event.clipboardData) {
+            event.clipboardData.setData('text/plain', processedText);
+            showToast('已格式化选中的公式内容', false);
+            return;
+        }
+
+        copyText(processedText).then(copied => {
+            showToast(
+                copied ? '已格式化选中的公式内容' : '选择复制失败',
+                !copied
+            );
+        });
     }
 
     function findRegexAfter(text, start, expression) {
@@ -375,84 +558,66 @@
         return repaired;
     }
 
-    async function repairClipboardItems(items, formulas) {
-        if (!window.ClipboardItem) return items;
+    async function repairClipboardAfterReplyCopy(button) {
+        const replyRoot = getAssistantReplyRoot(button);
+        const formulas = collectFormulas(replyRoot);
+        if (formulas.length === 0) return;
 
-        return Promise.all(Array.from(items).map(async item => {
-            if (!item.types || !item.types.includes('text/plain')) return item;
-
-            const data = {};
-            await Promise.all(item.types.map(async type => {
-                const blob = await item.getType(type);
-                if (type === 'text/plain') {
-                    data[type] = new Blob([repairCopiedReply(await blob.text(), formulas)], { type });
-                } else {
-                    data[type] = blob;
-                }
-            }));
-            return new ClipboardItem(data);
-        }));
-    }
-
-    /**
-     * 只包裹官方复制按钮即将触发的一次 Clipboard 调用；完成或超时后立即恢复。
-     * 不修改 Clipboard.prototype，也不影响之后的复制行为。
-     */
-    function armOneShotClipboardFix(formulas) {
-        const clipboard = navigator.clipboard;
-        if (!clipboard || formulas.length === 0) return;
-
-        const originalWriteText = clipboard.writeText;
-        const originalWrite = clipboard.write;
-        let armed = true;
-        let timeoutId;
-
-        const restore = () => {
-            if (!armed) return;
-            armed = false;
-            clearTimeout(timeoutId);
-            if (originalWriteText) clipboard.writeText = originalWriteText;
-            if (originalWrite) clipboard.write = originalWrite;
-        };
+        /*
+         * 让 ChatGPT 先完成它自己的复制，再读取并修复本次剪贴板。
+         * 原 GreasyFork 脚本也采用“按钮点击后延时读取剪贴板”的策略；
+         * 这里额外利用 DOM 中的真实公式源码来恢复 () / [] 定界符。
+         */
+        await new Promise(resolve => setTimeout(resolve, 120));
 
         try {
-            if (typeof originalWriteText === 'function') {
-                clipboard.writeText = function (text) {
-                    restore();
-                    return originalWriteText.call(clipboard, repairCopiedReply(text, formulas));
-                };
+            if (!navigator.clipboard || !navigator.clipboard.readText) {
+                throw new Error('Clipboard readText API unavailable');
             }
 
-            if (typeof originalWrite === 'function') {
-                clipboard.write = function (items) {
-                    restore();
-                    return repairClipboardItems(items, formulas)
-                        .then(repairedItems => originalWrite.call(clipboard, repairedItems))
-                        .catch(() => originalWrite.call(clipboard, items));
-                };
+            const originalText = await navigator.clipboard.readText();
+            const repairedText = repairCopiedReply(originalText, formulas);
+
+            if (repairedText === originalText) {
+                showToast('未检测到需要修复的公式', false);
+                return;
             }
 
-            timeoutId = setTimeout(restore, 2000);
-        } catch (_) {
-            restore();
+            const copied = await copyText(repairedText);
+            showToast(
+                copied
+                    ? `已修复回复中的 ${formulas.length} 个公式`
+                    : '公式修复后写回剪贴板失败',
+                !copied
+            );
+        } catch (error) {
+            console.error('[ChatGPT LaTeX] 回复复制修复失败:', error);
+            showToast('回复复制后处理失败，请查看控制台', true);
         }
     }
 
     function handleReplyCopy(event) {
-        const target = event.target instanceof Element ? event.target : event.target.parentElement;
+        const target = event.target instanceof Element
+            ? event.target
+            : event.target && event.target.parentElement;
         const button = target && target.closest('button');
         if (!isReplyCopyButton(button)) return;
 
-        const replyRoot = getAssistantReplyRoot(button);
-        if (!replyRoot) return;
+        /*
+         * 新版 ChatGPT 的用户消息复制按钮 aria-label 为“复制消息”，
+         * assistant 回复按钮为“复制”。这里只处理后者。
+         */
+        const label = (button.getAttribute('aria-label') || '').trim().toLowerCase();
+        if (label === '复制消息' || label === 'copy message') return;
 
-        armOneShotClipboardFix(collectFormulas(replyRoot));
+        void repairClipboardAfterReplyCopy(button);
     }
 
     document.addEventListener('mouseover', handleFormulaHover, true);
     document.addEventListener('mouseout', handleFormulaLeave, true);
     document.addEventListener('click', copySingleFormula, true);
     document.addEventListener('click', handleReplyCopy, true);
+    document.addEventListener('copy', handleSelectionCopy, { capture: true, passive: false });
     document.addEventListener('scroll', hidePreview, true);
     window.addEventListener('resize', hidePreview);
 })();
