@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         ChatGPT LaTeX 悬浮预览 + 复制修复
+// @name         ChatGPT LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      1.0.2
+// @version      1.1.0
 // @description  为 ChatGPT 公式提供悬浮 LaTeX 预览、单公式复制和回复复制修复
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -14,7 +14,7 @@
     if (window.__chatgptLatexEnhancerLoaded) return;
     window.__chatgptLatexEnhancerLoaded = true;
 
-    const FORMULA_CONTAINER_SELECTOR = '[data-client-katex-layout][aria-label]';
+    const FORMULA_CONTAINER_SELECTOR = '[data-client-katex-layout][aria-label], [data-markdown-copy="math"][aria-label]';
     const FORMULA_SELECTOR = '.katex';
     const HOVER_CLASS = 'chatgpt-latex-hover';
     let activeFormulaContainer = null;
@@ -175,20 +175,63 @@
     }
 
     function getAssistantReplyRoot(button) {
+        if (!button) return null;
+
+        /*
+         * 2026-09 新版 ChatGPT：
+         * 回复正文和回复 action bar 同属于一个 [data-turn-key]。
+         * assistant 正文单元使用 :assistant 后缀。
+         */
+        const turn = button.closest('[data-turn-key]');
+        if (turn) {
+            const assistantUnit = turn.querySelector(
+                '[data-content-search-unit-key$=":assistant"]'
+            );
+            if (assistantUnit) return assistantUnit;
+
+            const markdown = turn.querySelector(
+                '[data-markdown-text-style="assistant-message"]'
+            );
+            if (markdown) {
+                return markdown.closest('[data-content-search-unit-key]') || markdown;
+            }
+        }
+
+        // 旧版兼容。
         const directMessage = button.closest('[data-message-author-role="assistant"]');
         if (directMessage) return directMessage;
 
-        const turn = button.closest('article[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"]');
-        if (!turn || !turn.querySelector('[data-message-author-role="assistant"]')) return null;
-        return turn;
+        const oldTurn = button.closest(
+            'article[data-testid^="conversation-turn-"], [data-testid^="conversation-turn-"]'
+        );
+        if (!oldTurn || !oldTurn.querySelector('[data-message-author-role="assistant"]')) {
+            return null;
+        }
+        return oldTurn;
     }
 
     function isReplyCopyButton(button) {
         if (!button) return false;
+
+        /*
+         * 2026-09 新版回复级复制按钮：
+         *   .turn-action-controls button[aria-label="复制"]
+         *
+         * 限定 action bar，避免误把代码块内部的“复制”按钮当作回复复制。
+         */
+        const actionBar = button.closest('.turn-action-controls');
+        if (actionBar) {
+            const label = (button.getAttribute('aria-label') || '').trim().toLowerCase();
+            if (label === '复制' || label === 'copy') return true;
+        }
+
+        // 旧版兼容。
         const testId = button.getAttribute('data-testid') || '';
         return testId.includes('action-bar-copy') ||
             testId.includes('copy-turn') ||
-            Boolean(button.querySelector('svg[data-testid*="copy"], [data-testid*="action-bar-copy"]'));
+            Boolean(button.querySelector(
+                'svg[data-testid*="copy"], [data-testid*="action-bar-copy"]'
+            ));
     }
 
     function collectFormulas(replyRoot) {
