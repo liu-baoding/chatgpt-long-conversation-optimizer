@@ -7,8 +7,8 @@
 // @author       Liu Baoding; selection-copy strategy adapted from fanxing's AI网站公式复制Latex (MIT)
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
-// @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-long-conversation-optimizer/main/chatgpt-latex-copy-enhancer.user.js
-// @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-long-conversation-optimizer/main/chatgpt-latex-copy-enhancer.user.js
+// @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-latex-copy-enhancer.user.js
+// @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-latex-copy-enhancer.user.js
 // @grant        none
 // ==/UserScript==
 
