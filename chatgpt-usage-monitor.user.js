@@ -843,10 +843,14 @@
             renderData(data);
             return true;
         } catch (error) {
-            console.error('[ChatGPT Usage Monitor]', error);
-
             if (showError) {
+                console.error('[ChatGPT Usage Monitor]', error);
                 renderError(error);
+            } else {
+                console.debug(
+                    '[ChatGPT Usage Monitor] 自动刷新暂未成功，稍后重试：',
+                    error?.message || error
+                );
             }
 
             return false;
