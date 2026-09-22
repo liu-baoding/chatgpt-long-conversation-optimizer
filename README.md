@@ -28,34 +28,69 @@
 
 该脚本不处理公式、剪贴板或复制按钮行为。
 
-## 2. ChatGPT LaTeX 悬浮与复制增强
+## 2. AI LaTeX 悬浮与复制增强
 
 文件：`chatgpt-latex-copy-enhancer.user.js`
 
-为 ChatGPT 数学公式提供 LaTeX 源码预览、单公式复制、选择复制和整条回复复制修复。
+> 为保持已安装脚本的自动更新链路，v3.0.0 暂时保留原文件名；脚本显示名称已改为 **AI LaTeX 悬浮与复制增强**。
+
+v3.0.0 将原先针对 ChatGPT 的实现重构为“通用核心 + 网站适配器”。悬浮预览、单公式复制、选择复制、剪贴板写入和提示 UI 由核心统一处理，各网站只负责公式源码提取、块级/行内判断以及必要的复制按钮适配。
+
+### 当前适配
+
+- **ChatGPT**
+  - 当前 ChatGPT 公式容器与标准 KaTeX annotation 双路径
+  - 单公式复制
+  - 选择“文本 + 公式”复制
+  - 回复级“复制”按钮修复
+  - v3.1.0 起不再读取已有剪贴板：优先拦截网页自身 `clipboard.writeText` 的待写文本并修复，必要时回退为从回复 DOM 直接构造文本
+- **Claude**
+  - KaTeX / `math-inline` / `math-display`
+  - 单公式复制与选择复制
+- **DeepSeek**
+  - KaTeX annotation
+  - `.ds-markdown-math` 块级判断
+  - 单公式、选择复制与复制按钮修复
+  - 自动折叠每条回复的思考过程；只自动折叠一次，用户之后仍可手动展开
+  - 兼容当前 `div[role="button"].ds-button` 回复操作栏；复制图标无 aria-label/title 时使用 SVG path 指纹识别
+  - v3.1.0 起不再调用 `navigator.clipboard.readText()`，因此不会再触发浏览器“查看复制到剪贴板的文字和图片”权限提示
+  - 优先保留 DeepSeek 原生复制文本结构并在写入前修复公式；若站点未走 `writeText`，则自动从当前回复 DOM 构造纯文本回退
+- **Google Gemini**
+  - 标准 KaTeX annotation 优先
+  - 保留旧脚本已验证的 KaTeX render hook 作为源码回退
+  - 对选择边界落在公式内部的情况扩展到完整公式
+- **Google AI Studio**
+  - `ms-katex` 与标准 KaTeX annotation
+- **豆包**
+  - 优先读取 `data-custom-copy-text`
+  - 标准 KaTeX annotation 回退
+  - 回复复制按钮定界规范化
+- **知乎**
+  - 读取 `.ztext-math[data-tex]`
+- **通用 KaTeX 适配**
+  - Wikipedia
+  - Liaox
+  - Moonshot / Kimi 相关域名
+  - Stack Exchange
+  - OI Wiki
+  - 洛谷
+  - 腾讯元宝
 
 ### 主要功能
 
-- 鼠标悬浮公式时高亮公式区域。
-- 悬浮约 300 ms 后显示原始 LaTeX 源码。
-- 单击公式即可复制标准 LaTeX：
+- 鼠标悬浮公式时高亮并显示原始 LaTeX。
+- 单击公式复制标准 LaTeX：
   - 行内公式使用 `$...$`
   - 行间公式使用 `$$...$$`
-- 选择包含公式的文本后 `Ctrl+C`，自动把渲染公式转换回 LaTeX。
-- 修复新版 ChatGPT 回复级“复制”按钮中的公式格式。
-- 恢复 ChatGPT 复制过程中丢失反斜杠的 `(...)` / `[...]` 公式定界。
-- 兼容 `[data-client-katex-layout][aria-label]` 和标准 KaTeX `annotation[encoding="application/x-tex"]`。
+- 选择包含公式的文本后 `Ctrl+C`，自动将渲染公式恢复为 LaTeX。
+- 通过事件委托处理动态生成的回复，无需定时全页扫描公式节点。
+- ChatGPT 保留针对当前回复级复制按钮的专门修复逻辑。
+- DeepSeek / 豆包沿用旧脚本的按钮后处理思路，并增加代码块复制按钮排除。
+- 多站点兼容逻辑参考 fanxing 的 MIT 许可脚本“AI网站公式复制Latex”，并改造成彼此隔离的网站 adapter，避免大量跨站点 `if/else` 相互影响。
 
-选择复制机制参考 fanxing 的 MIT 许可脚本“AI网站公式复制Latex”的已验证思路，并针对 ChatGPT 当前 DOM 与回复复制按钮进行了专门适配。
+### 维护原则
 
-如果同时安装原版“AI网站公式复制Latex”，建议在该脚本中排除：
-
-```text
-https://chatgpt.com/*
-https://chat.openai.com/*
-```
-
-避免两个脚本同时监听 ChatGPT 的复制事件。
+各 adapter 可以独立声明能力。某个网站只在已经能够可靠获取公式源码时启用对应功能；不会为了“功能对齐”而强行劫持未知复制按钮。
 
 ## 3. ChatGPT 用量监视器
 
