@@ -1366,10 +1366,6 @@
     }
 
     function installClipboardWriteInterceptor() {
-        if (clipboardWriteInterceptorInstalled) {
-            return true;
-        }
-
         const clipboard = navigator.clipboard;
         if (!clipboard) return false;
 
