@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.1.0
-// @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站提供公式悬浮预览、单公式复制、选择复制和复制按钮修复
+// @version      3.2.0
+// @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制，并为 DeepSeek 自动折叠思考过程
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
 // @match        https://chatgpt.com/*
@@ -377,6 +377,242 @@
         );
     }
 
+    const deepSeekAutoCollapsedItems =
+        new WeakSet();
+
+    function getDeepSeekThinkingTitle(
+        thinkContent
+    ) {
+        const message =
+            thinkContent.closest(
+                '.ds-message'
+            ) ||
+            thinkContent.closest(
+                '[data-virtual-list-item-key]'
+            );
+
+        if (!message) return null;
+
+        const titlePattern =
+            /^(?:已思考|思考中|正在思考|thinking|thought)/i;
+
+        return Array.from(
+            message.querySelectorAll(
+                'span'
+            )
+        ).find(span => {
+            const text =
+                (
+                    span.textContent ||
+                    ''
+                ).trim();
+
+            return titlePattern.test(text);
+        }) || null;
+    }
+
+    function isDeepSeekThinkingExpanded(
+        thinkContent
+    ) {
+        if (
+            !thinkContent ||
+            !thinkContent.isConnected
+        ) {
+            return false;
+        }
+
+        const style =
+            getComputedStyle(
+                thinkContent
+            );
+
+        if (
+            style.display === 'none' ||
+            style.visibility === 'hidden'
+        ) {
+            return false;
+        }
+
+        return (
+            thinkContent.getClientRects()
+                .length > 0 &&
+            (
+                thinkContent.scrollHeight > 0 ||
+                thinkContent.textContent.trim()
+            )
+        );
+    }
+
+    function collapseDeepSeekThinking(
+        thinkContent
+    ) {
+        if (
+            !thinkContent ||
+            !thinkContent.matches(
+                '.ds-think-content'
+            )
+        ) {
+            return false;
+        }
+
+        const item =
+            thinkContent.closest(
+                '[data-virtual-list-item-key]'
+            ) ||
+            thinkContent.closest(
+                '.ds-message'
+            );
+
+        if (
+            item &&
+            deepSeekAutoCollapsedItems.has(
+                item
+            )
+        ) {
+            return false;
+        }
+
+        if (
+            !isDeepSeekThinkingExpanded(
+                thinkContent
+            )
+        ) {
+            return false;
+        }
+
+        const title =
+            getDeepSeekThinkingTitle(
+                thinkContent
+            );
+
+        if (!title) return false;
+
+        /*
+         * DeepSeek 当前思考区的标题本身没有稳定 class / role，
+         * 但点击“已思考（用时 …）/ 思考中 …”文字会冒泡到
+         * React 的折叠标题处理器。先标记，避免 MutationObserver
+         * 因折叠动作自身产生的 DOM 变化再次把它展开。
+         */
+        if (item) {
+            deepSeekAutoCollapsedItems.add(
+                item
+            );
+        }
+
+        title.dispatchEvent(
+            new MouseEvent(
+                'click',
+                {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window
+                }
+            )
+        );
+
+        return true;
+    }
+
+    function scanDeepSeekThinking(
+        root = document
+    ) {
+        const candidates = [];
+
+        if (
+            root instanceof Element &&
+            root.matches(
+                '.ds-think-content'
+            )
+        ) {
+            candidates.push(root);
+        }
+
+        if (
+            root.querySelectorAll
+        ) {
+            candidates.push(
+                ...root.querySelectorAll(
+                    '.ds-think-content'
+                )
+            );
+        }
+
+        for (
+            const thinkContent of candidates
+        ) {
+            /*
+             * 给 DeepSeek 一帧时间完成 header/content 的配对。
+             * 若首帧尚不可见，再做一次短延迟尝试。
+             */
+            requestAnimationFrame(() => {
+                if (
+                    collapseDeepSeekThinking(
+                        thinkContent
+                    )
+                ) {
+                    return;
+                }
+
+                window.setTimeout(
+                    () =>
+                        collapseDeepSeekThinking(
+                            thinkContent
+                        ),
+                    120
+                );
+            });
+        }
+    }
+
+    function installDeepSeekThinkingAutoCollapse() {
+        const start = () => {
+            scanDeepSeekThinking(
+                document
+            );
+
+            const observer =
+                new MutationObserver(
+                    records => {
+                        for (
+                            const record of records
+                        ) {
+                            for (
+                                const node of
+                                record.addedNodes
+                            ) {
+                                if (
+                                    node instanceof
+                                    Element
+                                ) {
+                                    scanDeepSeekThinking(
+                                        node
+                                    );
+                                }
+                            }
+                        }
+                    }
+                );
+
+            observer.observe(
+                document.body,
+                {
+                    childList: true,
+                    subtree: true
+                }
+            );
+        };
+
+        if (document.body) {
+            start();
+        } else {
+            document.addEventListener(
+                'DOMContentLoaded',
+                start,
+                { once: true }
+            );
+        }
+    }
+
     const SITE_ADAPTERS = [
         {
             id: 'chatgpt',
@@ -425,7 +661,8 @@
                         ) ||
                         carrier
                 }),
-            replyCopyMode: 'deepseek'
+            replyCopyMode: 'deepseek',
+            autoCollapseThinking: true
         },
         {
             id: 'gemini',
@@ -500,7 +737,14 @@
         ACTIVE_ADAPTER.beforeInit();
     }
 
-        const HOVER_CLASS = 'chatgpt-latex-hover';
+    if (
+        ACTIVE_ADAPTER.autoCollapseThinking &&
+        ACTIVE_ADAPTER.id === 'deepseek'
+    ) {
+        installDeepSeekThinkingAutoCollapse();
+    }
+
+    const HOVER_CLASS = 'chatgpt-latex-hover';
     let activeFormulaContainer = null;
     let previewTimer = null;
 
