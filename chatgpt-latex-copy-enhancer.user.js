@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.0.2
+// @version      3.1.0
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站提供公式悬浮预览、单公式复制、选择复制和复制按钮修复
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -1303,154 +1303,300 @@
         return modified;
     }
 
-    async function repairClipboardAfterReplyCopy(button) {
-        await new Promise(
-            resolve =>
-                setTimeout(resolve, 120)
+    let pendingReplyCopy = null;
+    let clipboardWriteInterceptorInstalled = false;
+
+    function getReplyCopyContext(button) {
+        let replyRoot = null;
+
+        if (ACTIVE_ADAPTER.id === 'chatgpt') {
+            replyRoot = getAssistantReplyRoot(button);
+        } else if (ACTIVE_ADAPTER.id === 'deepseek') {
+            replyRoot = getDeepSeekReplyRoot(button);
+        } else {
+            return null;
+        }
+
+        if (!replyRoot) return null;
+
+        const formulas = collectFormulas(replyRoot);
+        if (!formulas.length) return null;
+
+        let contentRoot = replyRoot;
+
+        if (ACTIVE_ADAPTER.id === 'chatgpt') {
+            contentRoot =
+                replyRoot.querySelector(
+                    '[data-markdown-text-style="assistant-message"]'
+                ) ||
+                replyRoot.querySelector('.markdown') ||
+                replyRoot;
+        }
+
+        return {
+            adapterId: ACTIVE_ADAPTER.id,
+            replyRoot,
+            contentRoot,
+            formulas,
+            expiresAt: Date.now() + 1500
+        };
+    }
+
+    function transformNativeReplyText(text, context) {
+        if (
+            !context ||
+            typeof text !== 'string'
+        ) {
+            return text;
+        }
+
+        let repaired = repairCopiedReply(
+            text,
+            context.formulas
         );
 
-        try {
-            if (
-                !navigator.clipboard ||
-                !navigator.clipboard.readText
-            ) {
-                throw new Error(
-                    'Clipboard readText API unavailable'
+        if (context.adapterId === 'deepseek') {
+            repaired =
+                normalizeCopiedDelimiters(
+                    repaired
                 );
-            }
+        }
 
-            const originalText =
-                await navigator.clipboard.readText();
+        return repaired;
+    }
 
-            let repairedText =
-                originalText;
+    function installClipboardWriteInterceptor() {
+        if (clipboardWriteInterceptorInstalled) {
+            return true;
+        }
 
-            let formulaCount =
-                0;
+        const clipboard = navigator.clipboard;
+        if (!clipboard) return false;
 
-            if (
-                ACTIVE_ADAPTER.replyCopyMode ===
-                'chatgpt'
-            ) {
-                const label =
-                    (
-                        button.getAttribute(
-                            'aria-label'
-                        ) ||
-                        ''
-                    )
-                        .trim()
-                        .toLowerCase();
+        const proto =
+            Object.getPrototypeOf(clipboard);
+
+        if (
+            !proto ||
+            typeof proto.writeText !== 'function'
+        ) {
+            return false;
+        }
+
+        const originalWriteText =
+            proto.writeText;
+
+        if (
+            originalWriteText
+                .__aiLatexWriteInterceptor
+        ) {
+            clipboardWriteInterceptorInstalled =
+                true;
+            return true;
+        }
+
+        const wrappedWriteText =
+            function (text) {
+                const context =
+                    pendingReplyCopy;
 
                 if (
-                    label === '复制消息' ||
-                    label === 'copy message'
+                    context &&
+                    Date.now() <=
+                        context.expiresAt &&
+                    typeof text === 'string'
                 ) {
-                    return;
+                    pendingReplyCopy = null;
+
+                    const repaired =
+                        transformNativeReplyText(
+                            text,
+                            context
+                        );
+
+                    const result =
+                        originalWriteText.call(
+                            this,
+                            repaired
+                        );
+
+                    Promise.resolve(result)
+                        .then(() => {
+                            showToast(
+                                `已修复回复中的 ${context.formulas.length} 个公式`,
+                                false
+                            );
+                        })
+                        .catch(() => {
+                            // Native site error handling remains authoritative.
+                        });
+
+                    return result;
                 }
 
-                const replyRoot =
-                    getAssistantReplyRoot(
-                        button
-                    );
+                return originalWriteText.call(
+                    this,
+                    text
+                );
+            };
 
-                const formulas =
-                    collectFormulas(
-                        replyRoot
-                    );
+        try {
+            Object.defineProperty(
+                wrappedWriteText,
+                '__aiLatexWriteInterceptor',
+                { value: true }
+            );
 
-                formulaCount =
-                    formulas.length;
-
-                if (!formulaCount) {
-                    return;
+            Object.defineProperty(
+                proto,
+                'writeText',
+                {
+                    configurable: true,
+                    writable: true,
+                    value: wrappedWriteText
                 }
+            );
 
-                repairedText =
-                    repairCopiedReply(
-                        originalText,
-                        formulas
-                    );
-            } else if (
-                ACTIVE_ADAPTER.replyCopyMode ===
-                'deepseek'
+            clipboardWriteInterceptorInstalled =
+                true;
+            return true;
+        } catch (error) {
+            console.debug(
+                '[AI LaTeX] 无法挂接 clipboard.writeText，将使用 DOM 回退复制：',
+                error
+            );
+            return false;
+        }
+    }
+
+    function replaceFormulasInCopyRoot(root) {
+        if (!root) return 0;
+
+        const candidates = [];
+
+        if (
+            root instanceof Element &&
+            root.matches(
+                ACTIVE_ADAPTER.selectionSelector
+            )
+        ) {
+            candidates.push(root);
+        }
+
+        candidates.push(
+            ...root.querySelectorAll(
+                ACTIVE_ADAPTER.selectionSelector
+            )
+        );
+
+        const replaced = new Set();
+
+        for (const candidate of candidates) {
+            const info =
+                getFormulaInfo(candidate);
+
+            if (
+                !info ||
+                !info.container ||
+                !info.container.parentNode ||
+                !root.contains(info.container) ||
+                replaced.has(info.container)
             ) {
-                const replyRoot =
-                    getDeepSeekReplyRoot(
-                        button
-                    );
+                continue;
+            }
 
-                const formulas =
-                    collectFormulas(
-                        replyRoot
-                    );
+            const replacement =
+                formatLatex(info);
 
-                formulaCount =
-                    formulas.length;
+            if (!replacement) continue;
 
-                /*
-                 * DeepSeek 的正文 DOM 中保留完整 application/x-tex，
-                 * 因此优先按已知公式顺序修复原生复制结果。
-                 * 如果当前复制结果只需要定界符规范化，再执行一次
-                 * 轻量 normalize 作为回退。
-                 */
-                repairedText =
-                    formulaCount
-                        ? repairCopiedReply(
-                            originalText,
-                            formulas
-                        )
-                        : originalText;
+            info.container.parentNode.replaceChild(
+                document.createTextNode(
+                    replacement
+                ),
+                info.container
+            );
 
-                repairedText =
-                    normalizeCopiedDelimiters(
-                        repairedText
-                    );
-            } else if (
-                ACTIVE_ADAPTER.replyCopyMode ===
-                'normalize'
+            replaced.add(info.container);
+        }
+
+        return replaced.size;
+    }
+
+    function buildReplyTextFromDom(context) {
+        if (!context || !context.contentRoot) {
+            return '';
+        }
+
+        const clone =
+            context.contentRoot.cloneNode(true);
+
+        replaceFormulasInCopyRoot(clone);
+
+        const sandbox =
+            document.createElement('div');
+
+        sandbox.style.cssText =
+            'position:fixed;' +
+            'left:-100000px;' +
+            'top:0;' +
+            'width:900px;' +
+            'opacity:0;' +
+            'pointer-events:none;' +
+            'white-space:normal;';
+
+        sandbox.appendChild(clone);
+        document.body.appendChild(sandbox);
+
+        let text = '';
+
+        try {
+            text =
+                sandbox.innerText ||
+                sandbox.textContent ||
+                '';
+        } finally {
+            sandbox.remove();
+        }
+
+        return text
+            .replace(/\r\n?/g, '\n')
+            .replace(/[ \t]+\n/g, '\n')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    }
+
+    function scheduleReplyCopyFallback(context) {
+        window.setTimeout(async () => {
+            if (
+                pendingReplyCopy !== context
             ) {
-                repairedText =
-                    normalizeCopiedDelimiters(
-                        originalText
-                    );
-            } else {
                 return;
             }
 
-            if (
-                repairedText ===
-                originalText
-            ) {
+            pendingReplyCopy = null;
+
+            const fallbackText =
+                buildReplyTextFromDom(
+                    context
+                );
+
+            if (!fallbackText) {
                 return;
             }
 
             const copied =
                 await copyText(
-                    repairedText
+                    fallbackText
                 );
 
             showToast(
                 copied
-                    ? (
-                        formulaCount
-                            ? `已修复回复中的 ${formulaCount} 个公式`
-                            : '已格式化复制内容'
-                    )
-                    : '公式修复后写回剪贴板失败',
+                    ? `已从页面直接复制并格式化 ${context.formulas.length} 个公式`
+                    : '回复复制失败',
                 !copied
             );
-        } catch (error) {
-            console.error(
-                `[AI LaTeX][${ACTIVE_ADAPTER.name}] 复制后处理失败:`,
-                error
-            );
-
-            showToast(
-                '复制后处理失败，请查看控制台',
-                true
-            );
-        }
+        }, 450);
     }
 
     function handleReplyCopy(event) {
@@ -1481,10 +1627,36 @@
             return;
         }
 
-        void repairClipboardAfterReplyCopy(
-            button
+        const context =
+            getReplyCopyContext(
+                button
+            );
+
+        if (!context) {
+            return;
+        }
+
+        /*
+         * 不再读取剪贴板。
+         *
+         * 优先在当前页面上下文挂接 clipboard.writeText：
+         * 网站仍执行原生复制，我们只在写入前用 DOM 中的真实
+         * LaTeX 源码修复文本。这样保留网站自己的 Markdown/
+         * 段落格式，同时不会触发浏览器“读取剪贴板”权限提示。
+         *
+         * 若站点不用 writeText（或浏览器禁止挂接），450 ms 后
+         * 使用当前回复 DOM 直接构造纯文本并覆盖写入。
+         */
+        pendingReplyCopy =
+            context;
+
+        installClipboardWriteInterceptor();
+        scheduleReplyCopyFallback(
+            context
         );
     }
+
+    installClipboardWriteInterceptor();
 
     console.info(`[AI LaTeX] 已启用 ${ACTIVE_ADAPTER.name} 适配器`);
 
