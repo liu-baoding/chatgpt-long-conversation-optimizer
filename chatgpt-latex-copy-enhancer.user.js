@@ -5,6 +5,8 @@
 // @description  为 ChatGPT 公式提供悬浮 LaTeX 预览、单公式复制和回复复制修复
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
+// @updateURL    https://raw.githubusercontent.com/liu-baoding/chatgpt-long-conversation-optimizer/main/chatgpt-latex-copy-enhancer.user.js
+// @downloadURL  https://raw.githubusercontent.com/liu-baoding/chatgpt-long-conversation-optimizer/main/chatgpt-latex-copy-enhancer.user.js
 // @grant        none
 // ==/UserScript==
 
