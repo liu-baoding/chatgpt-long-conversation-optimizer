@@ -50,6 +50,7 @@ v3.0.0 将原先针对 ChatGPT 的实现重构为“通用核心 + 网站适配�
   - KaTeX annotation
   - `.ds-markdown-math` 块级判断
   - 单公式、选择复制与复制按钮定界规范化
+  - 兼容 `button`、`[role="button"]` 与 `.ds-icon-button` 消息操作控件，并排除代码块复制按钮
 - **Google Gemini**
   - 标准 KaTeX annotation 优先
   - 保留旧脚本已验证的 KaTeX render hook 作为源码回退
