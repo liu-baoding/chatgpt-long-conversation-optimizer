@@ -51,6 +51,7 @@ v3.0.0 将原先针对 ChatGPT 的实现重构为“通用核心 + 网站适配�
   - KaTeX annotation
   - `.ds-markdown-math` 块级判断
   - 单公式、选择复制与复制按钮修复
+  - 自动折叠每条回复的思考过程；只自动折叠一次，用户之后仍可手动展开
   - 兼容当前 `div[role="button"].ds-button` 回复操作栏；复制图标无 aria-label/title 时使用 SVG path 指纹识别
   - v3.1.0 起不再调用 `navigator.clipboard.readText()`，因此不会再触发浏览器“查看复制到剪贴板的文字和图片”权限提示
   - 优先保留 DeepSeek 原生复制文本结构并在写入前修复公式；若站点未走 `writeText`，则自动从当前回复 DOM 构造纯文本回退
