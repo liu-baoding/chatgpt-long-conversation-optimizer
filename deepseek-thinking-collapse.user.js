@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek 思考折叠（CSS 优先）
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1
+// @version      1.1.2
 // @description  通过 document-start CSS 默认隐藏 DeepSeek 思考正文，并保留逐条手动展开/折叠，避免虚拟列表滚动时自动折叠造成跳转
 // @license      MIT
 // @author       Liu Baoding
@@ -205,12 +205,12 @@
             : target && target.parentElement;
         if (!element) return null;
 
-        const message = element.closest(
-            '.ds-message, [data-virtual-list-item-key]'
-        );
-        if (!message) return null;
+        const message = element.closest('.ds-message');
+        const item = element.closest('[data-virtual-list-item-key]');
+        const searchRoot = message || item;
+        if (!searchRoot) return null;
 
-        const title = Array.from(message.querySelectorAll('span')).find(span => {
+        const title = Array.from(searchRoot.querySelectorAll('span')).find(span => {
             const text = (span.textContent || '').trim();
             const header = span.parentElement;
             return (
@@ -223,8 +223,8 @@
         if (!title) return null;
 
         return {
-            message,
-            content: message.querySelector('.ds-think-content')
+            stateHost: item || message || searchRoot,
+            content: searchRoot.querySelector('.ds-think-content')
         };
     }
 
@@ -243,19 +243,19 @@
         const parts = findThinkingPartsFromClick(event.target);
         if (!parts) return;
 
-        const { message, content } = parts;
-        const manuallyOpen = message.classList.contains(BLOCK_OPEN_CLASS);
+        const { stateHost, content } = parts;
+        const manuallyOpen = stateHost.classList.contains(BLOCK_OPEN_CLASS);
 
         if (manuallyOpen) {
             /*
              * 这条已经由用户手动显示：先移除 CSS 覆盖，再让 DeepSeek 原生点击
              * 正常执行折叠。高度变化来自用户显式操作，而不是后台自动处理。
              */
-            message.classList.remove(BLOCK_OPEN_CLASS);
+            stateHost.classList.remove(BLOCK_OPEN_CLASS);
             return;
         }
 
-        message.classList.add(BLOCK_OPEN_CLASS);
+        stateHost.classList.add(BLOCK_OPEN_CLASS);
 
         if (content) {
             /*
@@ -267,8 +267,8 @@
         }
         /*
          * 若当前没有 .ds-think-content，说明 DeepSeek 原生状态本来就是折叠的。
-         * 不阻止事件，让原生 click 正常展开；BLOCK_OPEN_CLASS 已提前加到消息上，
-         * 新挂载出的 .ds-think-content 会立即可见。
+         * 不阻止事件，让原生 click 正常展开；BLOCK_OPEN_CLASS 已提前加到虚拟列表 item 上，
+         * 即使内部 .ds-message 被 React 重建，新挂载出的 .ds-think-content 也会立即可见。
          */
     }
 
