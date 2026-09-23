@@ -1,0 +1,161 @@
+name: One-shot split DeepSeek thinking feature
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/one-shot-split-deepseek-thinking.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Split DeepSeek thinking feature from LaTeX script
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('chatgpt-latex-copy-enhancer.user.js')
+          s = p.read_text(encoding='utf-8')
+
+          s = s.replace('// @version      3.3.0', '// @version      3.3.1', 1)
+          s = s.replace(
+              '// @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制，并为 DeepSeek 自动折叠思考过程',
+              '// @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制',
+              1,
+          )
+
+          start = s.find('    const deepSeekThinkingEligibleKeys = new Set();')
+          end = s.find('    const SITE_ADAPTERS = [', start)
+          if start < 0 or end < 0:
+              raise SystemExit('DeepSeek thinking implementation block not found')
+          s = s[:start] + s[end:]
+
+          old_adapter = "            replyCopyMode: 'deepseek',\n            autoCollapseThinking: true\n"
+          if old_adapter not in s:
+              raise SystemExit('DeepSeek adapter thinking flag not found')
+          s = s.replace(old_adapter, "            replyCopyMode: 'deepseek'\n", 1)
+
+          init_pattern = re.compile(
+              r"\n    if \(\n        ACTIVE_ADAPTER\.autoCollapseThinking &&\n        ACTIVE_ADAPTER\.id === 'deepseek'\n    \) \{\n        installDeepSeekThinkingAutoCollapse\(\);\n        installDeepSeekThinkingManualButton\(\);\n    \}\n",
+              re.S,
+          )
+          s, n = init_pattern.subn('\n', s, count=1)
+          if n != 1:
+              raise SystemExit(f'DeepSeek thinking init block replacements: {n}')
+
+          css_pattern = re.compile(
+              r"\n        #ai-deepseek-collapse-thinking \{.*?\n        #ai-deepseek-collapse-thinking:focus-visible \{.*?\n        \}\n",
+              re.S,
+          )
+          s, n = css_pattern.subn('\n', s, count=1)
+          if n != 1:
+              raise SystemExit(f'DeepSeek thinking CSS replacements: {n}')
+
+          forbidden = [
+              'deepSeekThinkingEligibleKeys',
+              'installDeepSeekThinkingAutoCollapse',
+              'installDeepSeekThinkingManualButton',
+              'ai-deepseek-collapse-thinking',
+              'autoCollapseThinking',
+          ]
+          leftovers = [token for token in forbidden if token in s]
+          if leftovers:
+              raise SystemExit(f'Thinking leftovers in LaTeX script: {leftovers}')
+
+          p.write_text(s, encoding='utf-8')
+
+          rp = Path('README.md')
+          r = rp.read_text(encoding='utf-8')
+          r = r.replace(
+              '一组相互独立的 Tampermonkey 用户脚本，用于增强 ChatGPT 网页端的长对话性能、LaTeX 复制和用量查看体验。',
+              '一组相互独立的 Tampermonkey 用户脚本，用于增强 ChatGPT / DeepSeek 网页端的长对话性能、LaTeX 复制、用量查看和思考过程显示体验。',
+              1,
+          )
+          r = r.replace('三个脚本可以单独安装、单独启用。', '四个脚本可以单独安装、单独启用。', 1)
+
+          deepseek_pattern = re.compile(
+              r"(- \*\*DeepSeek\*\*\n  - KaTeX annotation\n  - `\.ds-markdown-math` 块级判断\n  - 单公式、选择复制与复制按钮修复\n).*?(  - 兼容当前 `div\[role=\\\"button\\\"\]\.ds-button` 回复操作栏；复制图标无 aria-label/title 时使用 SVG path 指纹识别)",
+              re.S,
+          )
+          r, n = deepseek_pattern.subn(r'\1\2', r, count=1)
+          if n != 1:
+              raise SystemExit(f'README DeepSeek cleanup replacements: {n}')
+
+          section = '''## 4. DeepSeek 思考折叠（CSS 优先）
+
+文件：`deepseek-thinking-collapse.user.js`
+
+用于解决 DeepSeek 长对话中思考过程默认展开、占用大量空间的问题。
+
+### 设计原则
+
+- `document-start` 即注入 CSS，默认隐藏 `.ds-think-content`。
+- 不点击 DeepSeek 原生折叠按钮。
+- 不扫描或轮询虚拟列表。
+- 不使用 `MutationObserver` 追踪历史消息。
+- 不修改 `scrollTop` / `scrollBy`。
+- 历史消息被虚拟列表反复卸载、重新挂载时，CSS 会直接重新生效，不会产生“先展开再折叠”的高度突变。
+- 页面右下角提供“显示思考 / 隐藏思考”开关；`Alt+T` 可快速切换。
+
+该方案故意不维护“某条消息是否已经折叠”的 JS 状态，而是将显示/隐藏作为纯 CSS 展示策略，避免与 DeepSeek 自身的 React 虚拟列表状态机竞争。
+
+'''
+          marker = '## 安装\n'
+          if marker not in r:
+              raise SystemExit('README install marker not found')
+          r = r.replace(marker, section + marker, 1)
+
+          install_line = '- `https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-usage-monitor.user.js`\n'
+          if install_line not in r:
+              raise SystemExit('README install list marker not found')
+          r = r.replace(
+              install_line,
+              install_line + '- `https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/deepseek-thinking-collapse.user.js`\n',
+              1,
+          )
+
+          if '- `https://chat.deepseek.com/*`' not in r:
+              r = r.replace(
+                  '- `https://chat.openai.com/*`\n',
+                  '- `https://chat.openai.com/*`\n- `https://chat.deepseek.com/*`\n',
+                  1,
+              )
+
+          rp.write_text(r, encoding='utf-8')
+          PY
+
+      - name: Validate JavaScript syntax
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          for (const file of [
+            'chatgpt-latex-copy-enhancer.user.js',
+            'deepseek-thinking-collapse.user.js'
+          ]) {
+            const source = fs.readFileSync(file, 'utf8')
+              .replace(/^\/\/ ==UserScript==[\s\S]*?^\/\/ ==\/UserScript==\s*/m, '');
+            new Function(source);
+            console.log(`${file}: OK`);
+          }
+          NODE
+
+      - name: Commit cleanup
+        shell: bash
+        run: |
+          rm -f .github/workflows/one-shot-split-deepseek-thinking.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Split DeepSeek thinking collapse into CSS-first script"
+          git push origin HEAD:main
