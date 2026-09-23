@@ -1,8 +1,8 @@
 # ChatGPT Webchat Helper
 
-一组相互独立的 Tampermonkey 用户脚本，用于增强 ChatGPT 网页端的长对话性能、LaTeX 复制和用量查看体验。
+一组相互独立的 Tampermonkey 用户脚本，用于增强 ChatGPT / DeepSeek 网页端的长对话性能、LaTeX 复制、用量查看和思考过程显示体验。
 
-三个脚本可以单独安装、单独启用。
+四个脚本可以单独安装、单独启用。
 
 ## 1. ChatGPT 长对话性能优化器
 
@@ -51,12 +51,6 @@ v3.0.0 将原先针对 ChatGPT 的实现重构为“通用核心 + 网站适配�
   - KaTeX annotation
   - `.ds-markdown-math` 块级判断
   - 单公式、选择复制与复制按钮修复
-  - 自动折叠本页面会话中新生成的思考过程；历史记录重新进入虚拟列表时不会被重复折叠
-  - 只有用户仍位于聊天底部附近时才允许自动折叠，避免改变历史消息高度导致虚拟列表滚动锚点跳转
-  - 使用 `data-virtual-list-item-key` 记录消息状态，避免同一条消息重新 mount 后被当成新消息再次处理
-  - 用户仍可手动重新展开已自动折叠的思考过程
-  - 提供 DeepSeek 专用“折叠思考”浮动按钮，可手动折叠当前虚拟列表已加载的全部展开思考块；批量折叠时会尽量保持当前滚动锚点
-  - DeepSeek 使用虚拟列表，未挂载的历史消息不会为了“一键折叠”被强制加载，以避免重新引入历史滚动跳转
   - 兼容当前 `div[role="button"].ds-button` 回复操作栏；复制图标无 aria-label/title 时使用 SVG path 指纹识别
   - v3.1.0 起不再调用 `navigator.clipboard.readText()`，因此不会再触发浏览器“查看复制到剪贴板的文字和图片”权限提示
   - 优先保留 DeepSeek 原生复制文本结构并在写入前修复公式；若站点未走 `writeText`，则自动从当前回复 DOM 构造纯文本回退
@@ -96,6 +90,8 @@ v3.0.0 将原先针对 ChatGPT 的实现重构为“通用核心 + 网站适配�
 ### 维护原则
 
 各 adapter 可以独立声明能力。某个网站只在已经能够可靠获取公式源码时启用对应功能；不会为了“功能对齐”而强行劫持未知复制按钮。
+
+DeepSeek 思考过程显示/隐藏已从本脚本中完全拆出，由独立脚本 `deepseek-thinking-collapse.user.js` 负责，避免公式复制逻辑与 DeepSeek 虚拟列表行为互相影响。
 
 ## 3. ChatGPT 用量监视器
 
@@ -140,6 +136,26 @@ v3.0.0 将原先针对 ChatGPT 的实现重构为“通用核心 + 网站适配�
 
 该脚本使用 ChatGPT 网页内部接口，而不是稳定的公开 OpenAI API。若 ChatGPT 后续调整内部接口或会话结构，可能需要同步更新脚本。
 
+## 4. DeepSeek 思考折叠（CSS 优先）
+
+文件：`deepseek-thinking-collapse.user.js`
+
+用于解决 DeepSeek 长对话中思考过程默认展开、占用大量空间的问题。
+
+### 设计原则
+
+- `document-start` 即注入 CSS，默认隐藏 `.ds-think-content`。
+- 不点击 DeepSeek 原生折叠按钮。
+- 不扫描或轮询虚拟列表。
+- 不使用 `MutationObserver` 追踪历史消息。
+- 不修改 `scrollTop` / `scrollBy`。
+- 历史消息被虚拟列表反复卸载、重新挂载时，CSS 会直接重新生效，不会产生“先展开再折叠”的高度突变。
+- 页面右下角提供“显示思考 / 隐藏思考”开关；`Alt+T` 可快速切换。
+
+该方案故意不维护“某条消息是否已经折叠”的 JS 状态，而是将显示/隐藏作为纯 CSS 展示策略，避免与 DeepSeek 自身的 React 虚拟列表状态机竞争。
+
+> 若曾安装第三方 DeepSeek 自动折叠脚本，请先禁用或卸载，避免它继续模拟点击原生折叠按钮并与本脚本冲突。
+
 ## 安装
 
 仓库为 Public，可直接从 GitHub Raw 地址安装。Tampermonkey 会识别 `.user.js` 并打开安装页面。
@@ -149,6 +165,7 @@ v3.0.0 将原先针对 ChatGPT 的实现重构为“通用核心 + 网站适配�
 - `https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-long-conversation-optimizer.user.js`
 - `https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-latex-copy-enhancer.user.js`
 - `https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/chatgpt-usage-monitor.user.js`
+- `https://raw.githubusercontent.com/liu-baoding/chatgpt-webchat-helper/main/deepseek-thinking-collapse.user.js`
 
 脚本头部的 `@updateURL` 和 `@downloadURL` 均指向 `main` 分支。发布新版本时应同步提高 `@version`，Tampermonkey 才会识别为更新。
 
@@ -160,6 +177,7 @@ v3.0.0 将原先针对 ChatGPT 的实现重构为“通用核心 + 网站适配�
 
 - `https://chatgpt.com/*`
 - `https://chat.openai.com/*`
+- `https://chat.deepseek.com/*`
 
 ## 许可证
 
