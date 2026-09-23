@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DeepSeek 思考折叠（CSS 优先）
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
-// @description  通过 document-start CSS 默认隐藏 DeepSeek 思考正文，并支持逐条手动展开/折叠，避免虚拟列表滚动时反复触发原生折叠造成跳转
+// @version      1.1.1
+// @description  通过 document-start CSS 默认隐藏 DeepSeek 思考正文，并保留逐条手动展开/折叠，避免虚拟列表滚动时自动折叠造成跳转
 // @license      MIT
 // @author       Liu Baoding
 // @match        https://chat.deepseek.com/*
@@ -21,7 +21,6 @@
 
     const ROOT_SHOW_CLASS = 'dstc-show-thinking';
     const BLOCK_OPEN_CLASS = 'dstc-manual-open';
-    const BLOCK_CLOSED_CLASS = 'dstc-manual-closed';
     const DARK_BUTTON_CLASS = 'dstc-dark-mode';
     const STYLE_ID = 'dstc-style';
     const BUTTON_ID = 'dstc-toggle';
@@ -29,16 +28,16 @@
 
     /*
      * 核心原则：
-     * 1. 默认不点击 DeepSeek 原生折叠按钮；
+     * 1. 不自动点击 DeepSeek 原生折叠按钮；
      * 2. 不扫描或轮询虚拟列表；
      * 3. 不使用 MutationObserver 追踪历史消息；
      * 4. 不修改 scrollTop / scrollBy；
      * 5. 在 document-start 就注入 CSS，让思考正文第一次参与布局时就是隐藏状态；
-     * 6. 只有用户主动点击某条“已思考/思考中”标题时，才切换该条消息的 CSS 展示状态。
+     * 6. 用户主动点击某条思考标题时，允许该条消息临时显示，并尽量保留 DeepSeek 原生展开/折叠行为。
      *
      * DeepSeek 当前展开的思考正文带有 .ds-think-content。
-     * 即便同一历史消息被虚拟列表反复 unmount / remount，CSS 也会直接生效，
-     * 不会发生“先展开 -> 脚本再点击折叠 -> 消息高度突变”的过程。
+     * 历史消息被虚拟列表反复 unmount / remount 时，CSS 会直接生效，
+     * 不会发生“先展开 -> 脚本再自动点击折叠 -> 消息高度突变”的过程。
      */
     function installStyle() {
         if (document.getElementById(STYLE_ID)) return;
@@ -56,10 +55,6 @@
 
             html.${ROOT_SHOW_CLASS} .ds-think-content {
                 display: block !important;
-            }
-
-            html.${ROOT_SHOW_CLASS} .${BLOCK_CLOSED_CLASS} .ds-think-content {
-                display: none !important;
             }
 
             #${BUTTON_ID} {
@@ -193,10 +188,8 @@
     }
 
     function clearManualOverrides() {
-        document.querySelectorAll(
-            `.${BLOCK_OPEN_CLASS}, .${BLOCK_CLOSED_CLASS}`
-        ).forEach(element => {
-            element.classList.remove(BLOCK_OPEN_CLASS, BLOCK_CLOSED_CLASS);
+        document.querySelectorAll(`.${BLOCK_OPEN_CLASS}`).forEach(element => {
+            element.classList.remove(BLOCK_OPEN_CLASS);
         });
     }
 
@@ -229,39 +222,54 @@
 
         if (!title) return null;
 
-        const content = message.querySelector('.ds-think-content');
-        if (!content) return null;
-
         return {
-            content,
-            container: content.parentElement || message
+            message,
+            content: message.querySelector('.ds-think-content')
         };
     }
 
-    function handleNativeThinkingClick(event) {
-        const parts = findThinkingPartsFromClick(event.target);
-        if (!parts) return;
-
-        /*
-         * DeepSeek 自己的折叠点击会改变 React 内部状态，并可能让当前隐藏的正文
-         * 进入真正的“折叠”状态。这里截获用户主动点击，仅切换我们的 CSS class，
-         * 从而既能逐条展开/折叠，又不重新引入虚拟列表自动滚动问题。
-         */
+    function stopNativeClick(event) {
         event.preventDefault();
         event.stopPropagation();
         event.stopImmediatePropagation();
+    }
 
-        const { container } = parts;
-
+    function handleNativeThinkingClick(event) {
         if (isShowingThinking()) {
-            const shouldClose = !container.classList.contains(BLOCK_CLOSED_CLASS);
-            container.classList.remove(BLOCK_OPEN_CLASS, BLOCK_CLOSED_CLASS);
-            if (shouldClose) container.classList.add(BLOCK_CLOSED_CLASS);
-        } else {
-            const shouldOpen = !container.classList.contains(BLOCK_OPEN_CLASS);
-            container.classList.remove(BLOCK_OPEN_CLASS, BLOCK_CLOSED_CLASS);
-            if (shouldOpen) container.classList.add(BLOCK_OPEN_CLASS);
+            /* “显示全部”模式下完全交回 DeepSeek 原生折叠逻辑。 */
+            return;
         }
+
+        const parts = findThinkingPartsFromClick(event.target);
+        if (!parts) return;
+
+        const { message, content } = parts;
+        const manuallyOpen = message.classList.contains(BLOCK_OPEN_CLASS);
+
+        if (manuallyOpen) {
+            /*
+             * 这条已经由用户手动显示：先移除 CSS 覆盖，再让 DeepSeek 原生点击
+             * 正常执行折叠。高度变化来自用户显式操作，而不是后台自动处理。
+             */
+            message.classList.remove(BLOCK_OPEN_CLASS);
+            return;
+        }
+
+        message.classList.add(BLOCK_OPEN_CLASS);
+
+        if (content) {
+            /*
+             * 正文其实已经处于 DeepSeek 的“展开”状态，只是被我们的 CSS 隐藏。
+             * 此时若继续让原生 click 执行，它反而会把内容折叠掉；因此只阻止这一次
+             * 原生点击，让刚加上的 CSS class 直接把正文显示出来。
+             */
+            stopNativeClick(event);
+        }
+        /*
+         * 若当前没有 .ds-think-content，说明 DeepSeek 原生状态本来就是折叠的。
+         * 不阻止事件，让原生 click 正常展开；BLOCK_OPEN_CLASS 已提前加到消息上，
+         * 新挂载出的 .ds-think-content 会立即可见。
+         */
     }
 
     function installButton() {
@@ -272,16 +280,15 @@
         button.type = 'button';
         button.addEventListener('click', toggleThinkingVisibility);
         button.addEventListener('pointerenter', syncButtonTheme);
-        updateButton(button);
         document.body.appendChild(button);
-        syncButtonTheme();
+        updateButton(button);
     }
 
     installStyle();
 
     /*
-     * capture 阶段拦截 DeepSeek 思考标题的原生点击；只处理用户主动操作，
-     * 不会因为虚拟列表 mount / unmount 自动触发。
+     * capture 阶段只识别用户对思考标题的真实点击；虚拟列表 mount / unmount
+     * 不会触发这里，因此不会重新引入自动滚动到底部的问题。
      */
     document.addEventListener('click', handleNativeThinkingClick, true);
 
