@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.2.0
+// @version      3.2.1
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制，并为 DeepSeek 自动折叠思考过程
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -305,6 +305,7 @@
             }
         }, 250);
     }
+
     function geminiFormulaInfo(node) {
         const element = elementFromNode(node);
         if (!element) return null;
@@ -377,8 +378,11 @@
         );
     }
 
-    const deepSeekAutoCollapsedItems =
-        new WeakSet();
+    const deepSeekThinkingActiveKeys = new Set();
+    const deepSeekThinkingCollapsedKeys = new Set();
+    const deepSeekThinkingActiveItems = new WeakSet();
+    const deepSeekThinkingCollapsedItems = new WeakSet();
+    const deepSeekThinkingScheduledContents = new WeakSet();
 
     function getDeepSeekThinkingTitle(
         thinkContent
@@ -409,6 +413,197 @@
 
             return titlePattern.test(text);
         }) || null;
+    }
+
+    function getDeepSeekThinkingIdentity(
+        thinkContent
+    ) {
+        const item =
+            thinkContent.closest(
+                '[data-virtual-list-item-key]'
+            ) ||
+            thinkContent.closest(
+                '.ds-message'
+            );
+
+        const key =
+            item &&
+            item.getAttribute(
+                'data-virtual-list-item-key'
+            );
+
+        return {
+            item,
+            key: key || ''
+        };
+    }
+
+    function getDeepSeekThinkingStatus(title) {
+        const text =
+            (
+                title?.textContent ||
+                ''
+            ).trim();
+
+        if (
+            /^(?:思考中|正在思考|thinking)/i.test(
+                text
+            )
+        ) {
+            return 'active';
+        }
+
+        if (
+            /^(?:已思考|thought)/i.test(
+                text
+            )
+        ) {
+            return 'finished';
+        }
+
+        return 'unknown';
+    }
+
+    function markDeepSeekThinkingActive(identity) {
+        if (identity.key) {
+            deepSeekThinkingActiveKeys.add(
+                identity.key
+            );
+        } else if (identity.item) {
+            deepSeekThinkingActiveItems.add(
+                identity.item
+            );
+        }
+    }
+
+    function wasDeepSeekThinkingActive(identity) {
+        if (identity.key) {
+            return deepSeekThinkingActiveKeys.has(
+                identity.key
+            );
+        }
+
+        return Boolean(
+            identity.item &&
+            deepSeekThinkingActiveItems.has(
+                identity.item
+            )
+        );
+    }
+
+    function markDeepSeekThinkingCollapsed(identity) {
+        if (identity.key) {
+            deepSeekThinkingCollapsedKeys.add(
+                identity.key
+            );
+        } else if (identity.item) {
+            deepSeekThinkingCollapsedItems.add(
+                identity.item
+            );
+        }
+    }
+
+    function unmarkDeepSeekThinkingCollapsed(identity) {
+        if (identity.key) {
+            deepSeekThinkingCollapsedKeys.delete(
+                identity.key
+            );
+        } else if (identity.item) {
+            deepSeekThinkingCollapsedItems.delete(
+                identity.item
+            );
+        }
+    }
+
+    function wasDeepSeekThinkingCollapsed(identity) {
+        if (identity.key) {
+            return deepSeekThinkingCollapsedKeys.has(
+                identity.key
+            );
+        }
+
+        return Boolean(
+            identity.item &&
+            deepSeekThinkingCollapsedItems.has(
+                identity.item
+            )
+        );
+    }
+
+    function getDeepSeekScrollContainer(element) {
+        let current =
+            element &&
+            element.parentElement;
+
+        while (
+            current &&
+            current !== document.body
+        ) {
+            const style =
+                getComputedStyle(current);
+
+            if (
+                /^(?:auto|scroll|overlay)$/.test(
+                    style.overflowY
+                ) &&
+                current.scrollHeight >
+                    current.clientHeight + 4
+            ) {
+                return current;
+            }
+
+            current = current.parentElement;
+        }
+
+        return (
+            document.scrollingElement ||
+            document.documentElement
+        );
+    }
+
+    function isNearDeepSeekBottom(
+        thinkContent,
+        threshold = 320
+    ) {
+        const scroller =
+            getDeepSeekScrollContainer(
+                thinkContent
+            );
+
+        if (!scroller) return false;
+
+        const isDocumentScroller =
+            scroller ===
+                document.scrollingElement ||
+            scroller === document.documentElement ||
+            scroller === document.body;
+
+        if (isDocumentScroller) {
+            const scrollTop =
+                window.scrollY ||
+                document.documentElement.scrollTop ||
+                document.body.scrollTop ||
+                0;
+
+            const viewportHeight =
+                window.innerHeight ||
+                document.documentElement.clientHeight ||
+                0;
+
+            return (
+                scroller.scrollHeight -
+                scrollTop -
+                viewportHeight <=
+                threshold
+            );
+        }
+
+        return (
+            scroller.scrollHeight -
+            scroller.scrollTop -
+            scroller.clientHeight <=
+            threshold
+        );
     }
 
     function isDeepSeekThinkingExpanded(
@@ -455,31 +650,6 @@
             return false;
         }
 
-        const item =
-            thinkContent.closest(
-                '[data-virtual-list-item-key]'
-            ) ||
-            thinkContent.closest(
-                '.ds-message'
-            );
-
-        if (
-            item &&
-            deepSeekAutoCollapsedItems.has(
-                item
-            )
-        ) {
-            return false;
-        }
-
-        if (
-            !isDeepSeekThinkingExpanded(
-                thinkContent
-            )
-        ) {
-            return false;
-        }
-
         const title =
             getDeepSeekThinkingTitle(
                 thinkContent
@@ -487,17 +657,57 @@
 
         if (!title) return false;
 
-        /*
-         * DeepSeek 当前思考区的标题本身没有稳定 class / role，
-         * 但点击“已思考（用时 …）/ 思考中 …”文字会冒泡到
-         * React 的折叠标题处理器。先标记，避免 MutationObserver
-         * 因折叠动作自身产生的 DOM 变化再次把它展开。
-         */
-        if (item) {
-            deepSeekAutoCollapsedItems.add(
-                item
+        const status =
+            getDeepSeekThinkingStatus(
+                title
             );
+
+        const identity =
+            getDeepSeekThinkingIdentity(
+                thinkContent
+            );
+
+        /*
+         * 只把“本次页面会话中亲眼见过正在思考状态”的消息视为
+         * 新回复。历史消息在虚拟列表中重新 mount 时通常直接是
+         * “已思考”，因此不会再被自动点击，从源头避免改变历史
+         * item 高度并触发 DeepSeek 的滚动锚点校正。
+         */
+        if (status === 'active') {
+            markDeepSeekThinkingActive(
+                identity
+            );
+        } else if (
+            status !== 'finished' ||
+            !wasDeepSeekThinkingActive(
+                identity
+            )
+        ) {
+            return false;
         }
+
+        if (
+            wasDeepSeekThinkingCollapsed(
+                identity
+            ) ||
+            !isNearDeepSeekBottom(
+                thinkContent
+            ) ||
+            !isDeepSeekThinkingExpanded(
+                thinkContent
+            )
+        ) {
+            return false;
+        }
+
+        /*
+         * 用户正在浏览历史记录时不会执行折叠。只有接近当前聊天
+         * 底部时才允许触发原生折叠，因此延迟重试也不会把用户从
+         * 上方历史位置拉回到底部。
+         */
+        markDeepSeekThinkingCollapsed(
+            identity
+        );
 
         title.dispatchEvent(
             new MouseEvent(
@@ -509,6 +719,23 @@
                 }
             )
         );
+
+        /*
+         * 如果 DeepSeek 在这一帧还没挂好折叠处理器，则撤销标记，
+         * 让后续的有限次延迟尝试能够重试。
+         */
+        requestAnimationFrame(() => {
+            if (
+                thinkContent.isConnected &&
+                isDeepSeekThinkingExpanded(
+                    thinkContent
+                )
+            ) {
+                unmarkDeepSeekThinkingCollapsed(
+                    identity
+                );
+            }
+        });
 
         return true;
     }
@@ -540,32 +767,45 @@
         for (
             const thinkContent of candidates
         ) {
-            /*
-             * 给 DeepSeek 一帧时间完成 header/content 的配对。
-             * 若首帧尚不可见，再做一次短延迟尝试。
-             */
-            requestAnimationFrame(() => {
-                if (
-                    collapseDeepSeekThinking(
-                        thinkContent
-                    )
-                ) {
-                    return;
-                }
+            if (
+                deepSeekThinkingScheduledContents.has(
+                    thinkContent
+                )
+            ) {
+                continue;
+            }
 
-                window.setTimeout(
-                    () =>
-                        collapseDeepSeekThinking(
-                            thinkContent
-                        ),
-                    120
+            deepSeekThinkingScheduledContents.add(
+                thinkContent
+            );
+
+            const tryCollapse = () =>
+                collapseDeepSeekThinking(
+                    thinkContent
                 );
-            });
+
+            requestAnimationFrame(
+                tryCollapse
+            );
+
+            window.setTimeout(
+                tryCollapse,
+                120
+            );
+
+            window.setTimeout(
+                tryCollapse,
+                500
+            );
         }
     }
 
     function installDeepSeekThinkingAutoCollapse() {
         const start = () => {
+            /*
+             * 初始扫描是安全的：已经完成的历史思考不会被折叠；
+             * 只有当前仍处于“思考中”的新回复会被登记并处理。
+             */
             scanDeepSeekThinking(
                 document
             );
@@ -980,6 +1220,7 @@
 
         return oldTurn;
     }
+
     function getDeepSeekReplyRoot(button) {
         if (!button) return null;
 
@@ -1013,7 +1254,6 @@
             )
         ) || null;
     }
-
 
     function isReplyCopyButton(button) {
         if (!button) return false;
