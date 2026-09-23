@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.2.2
+// @version      3.3.0
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制，并为 DeepSeek 自动折叠思考过程
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -802,6 +802,311 @@
         }
     }
 
+    function isDeepSeekDocumentScroller(scroller) {
+        return Boolean(
+            scroller &&
+            (
+                scroller === document.scrollingElement ||
+                scroller === document.documentElement ||
+                scroller === document.body
+            )
+        );
+    }
+
+    function captureDeepSeekManualCollapseScrollState(
+        referenceElement
+    ) {
+        const scroller =
+            getDeepSeekScrollContainer(
+                referenceElement ||
+                document.querySelector(
+                    '.ds-virtual-list-items'
+                ) ||
+                document.body
+            );
+
+        if (!scroller) return null;
+
+        const isDocumentScroller =
+            isDeepSeekDocumentScroller(
+                scroller
+            );
+
+        const viewportTop =
+            isDocumentScroller
+                ? 0
+                : scroller
+                    .getBoundingClientRect()
+                    .top;
+
+        const viewportBottom =
+            isDocumentScroller
+                ? window.innerHeight
+                : scroller
+                    .getBoundingClientRect()
+                    .bottom;
+
+        const items = Array.from(
+            document.querySelectorAll(
+                '[data-virtual-list-item-key]'
+            )
+        );
+
+        const anchor =
+            items.find(item => {
+                const rect =
+                    item.getBoundingClientRect();
+
+                return (
+                    rect.bottom >
+                        viewportTop + 4 &&
+                    rect.top <
+                        viewportBottom - 4
+                );
+            }) || null;
+
+        const anchorTop =
+            anchor
+                ? anchor
+                    .getBoundingClientRect()
+                    .top
+                : null;
+
+        const scrollTop =
+            isDocumentScroller
+                ? (
+                    window.scrollY ||
+                    document.documentElement
+                        .scrollTop ||
+                    document.body.scrollTop ||
+                    0
+                )
+                : scroller.scrollTop;
+
+        const viewportHeight =
+            isDocumentScroller
+                ? (
+                    window.innerHeight ||
+                    document.documentElement
+                        .clientHeight ||
+                    0
+                )
+                : scroller.clientHeight;
+
+        const distanceFromBottom =
+            scroller.scrollHeight -
+            scrollTop -
+            viewportHeight;
+
+        return {
+            scroller,
+            isDocumentScroller,
+            anchor,
+            anchorTop,
+            nearBottom:
+                distanceFromBottom <= 120
+        };
+    }
+
+    function restoreDeepSeekManualCollapseScrollState(
+        state
+    ) {
+        if (!state || !state.scroller) {
+            return;
+        }
+
+        const {
+            scroller,
+            isDocumentScroller,
+            anchor,
+            anchorTop,
+            nearBottom
+        } = state;
+
+        if (nearBottom) {
+            if (isDocumentScroller) {
+                window.scrollTo(
+                    0,
+                    scroller.scrollHeight
+                );
+            } else {
+                scroller.scrollTop =
+                    scroller.scrollHeight;
+            }
+            return;
+        }
+
+        if (
+            !anchor ||
+            !anchor.isConnected ||
+            !Number.isFinite(anchorTop)
+        ) {
+            return;
+        }
+
+        const currentTop =
+            anchor
+                .getBoundingClientRect()
+                .top;
+
+        const delta =
+            currentTop - anchorTop;
+
+        if (Math.abs(delta) < 0.5) {
+            return;
+        }
+
+        if (isDocumentScroller) {
+            window.scrollBy(
+                0,
+                delta
+            );
+        } else {
+            scroller.scrollTop +=
+                delta;
+        }
+    }
+
+    function collapseAllLoadedDeepSeekThinking() {
+        const expandedContents =
+            Array.from(
+                document.querySelectorAll(
+                    '.ds-think-content'
+                )
+            ).filter(
+                isDeepSeekThinkingExpanded
+            );
+
+        if (!expandedContents.length) {
+            showToast(
+                '当前已加载区域没有展开的思考块',
+                false
+            );
+            return;
+        }
+
+        const scrollState =
+            captureDeepSeekManualCollapseScrollState(
+                expandedContents[0]
+            );
+
+        let collapsedCount = 0;
+
+        for (
+            const thinkContent of
+            expandedContents
+        ) {
+            const title =
+                getDeepSeekThinkingTitle(
+                    thinkContent
+                );
+
+            if (!title) continue;
+
+            const item =
+                thinkContent.closest(
+                    '[data-virtual-list-item-key]'
+                );
+
+            const rawKey =
+                item &&
+                item.getAttribute(
+                    'data-virtual-list-item-key'
+                );
+
+            if (rawKey) {
+                deepSeekThinkingCollapsedKeys.add(
+                    rawKey
+                );
+            }
+
+            title.dispatchEvent(
+                new MouseEvent(
+                    'click',
+                    {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window
+                    }
+                )
+            );
+
+            collapsedCount += 1;
+        }
+
+        const restore = () =>
+            restoreDeepSeekManualCollapseScrollState(
+                scrollState
+            );
+
+        requestAnimationFrame(() => {
+            restore();
+            window.setTimeout(
+                restore,
+                60
+            );
+            window.setTimeout(
+                restore,
+                180
+            );
+            window.setTimeout(
+                restore,
+                360
+            );
+        });
+
+        showToast(
+            collapsedCount
+                ? `已折叠当前已加载的 ${collapsedCount} 个思考块`
+                : '当前已加载区域没有可折叠的思考块',
+            false
+        );
+    }
+
+    function installDeepSeekThinkingManualButton() {
+        const createButton = () => {
+            if (
+                document.getElementById(
+                    'ai-deepseek-collapse-thinking'
+                )
+            ) {
+                return;
+            }
+
+            const button =
+                document.createElement(
+                    'button'
+                );
+
+            button.id =
+                'ai-deepseek-collapse-thinking';
+            button.type = 'button';
+            button.textContent =
+                '折叠思考';
+            button.title =
+                '折叠当前已加载的所有 DeepSeek 思考过程；未挂载的历史消息不会被强制加载';
+
+            button.addEventListener(
+                'click',
+                collapseAllLoadedDeepSeekThinking
+            );
+
+            document.body.appendChild(
+                button
+            );
+        };
+
+        if (document.body) {
+            createButton();
+        } else {
+            document.addEventListener(
+                'DOMContentLoaded',
+                createButton,
+                { once: true }
+            );
+        }
+    }
+
     function installDeepSeekThinkingAutoCollapse() {
         const start = () => {
             primeDeepSeekThinkingState();
@@ -1023,6 +1328,7 @@
         ACTIVE_ADAPTER.id === 'deepseek'
     ) {
         installDeepSeekThinkingAutoCollapse();
+        installDeepSeekThinkingManualButton();
     }
 
     const HOVER_CLASS = 'chatgpt-latex-hover';
@@ -1064,6 +1370,36 @@
             z-index: 2147483647;
         }
         .chatgpt-latex-toast.error { background: #c62828; }
+        #ai-deepseek-collapse-thinking {
+            position: fixed;
+            right: 20px;
+            bottom: 112px;
+            z-index: 2147483000;
+            padding: 7px 11px;
+            border: 1px solid rgba(127, 127, 127, 0.32);
+            border-radius: 999px;
+            color: inherit;
+            background: rgba(127, 127, 127, 0.12);
+            -webkit-backdrop-filter: blur(10px);
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.10);
+            font: 12px/1.2 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            cursor: pointer;
+            opacity: 0.82;
+            transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease;
+        }
+        #ai-deepseek-collapse-thinking:hover {
+            opacity: 1;
+            transform: translateY(-1px);
+            background: rgba(127, 127, 127, 0.18);
+        }
+        #ai-deepseek-collapse-thinking:active {
+            transform: translateY(0);
+        }
+        #ai-deepseek-collapse-thinking:focus-visible {
+            outline: 2px solid #4d8dff;
+            outline-offset: 2px;
+        }
     `;
     document.head.appendChild(style);
 
