@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.2.1
+// @version      3.2.2
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制，并为 DeepSeek 自动折叠思考过程
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -378,11 +378,13 @@
         );
     }
 
-    const deepSeekThinkingActiveKeys = new Set();
+    const deepSeekThinkingEligibleKeys = new Set();
     const deepSeekThinkingCollapsedKeys = new Set();
-    const deepSeekThinkingActiveItems = new WeakSet();
-    const deepSeekThinkingCollapsedItems = new WeakSet();
     const deepSeekThinkingScheduledContents = new WeakSet();
+    let deepSeekThinkingRoute = '';
+    let deepSeekThinkingBaselineKey = -1;
+    let deepSeekThinkingReady = false;
+    let deepSeekThinkingPrimeTimer = null;
 
     function getDeepSeekThinkingTitle(
         thinkContent
@@ -415,125 +417,158 @@
         }) || null;
     }
 
-    function getDeepSeekThinkingIdentity(
-        thinkContent
-    ) {
-        const item =
-            thinkContent.closest(
-                '[data-virtual-list-item-key]'
-            ) ||
-            thinkContent.closest(
-                '.ds-message'
-            );
+    function getDeepSeekItemKey(item) {
+        if (!item) return -1;
 
-        const key =
-            item &&
+        const raw =
             item.getAttribute(
                 'data-virtual-list-item-key'
             );
 
-        return {
-            item,
-            key: key || ''
-        };
+        if (!raw || !/^\d+$/.test(raw)) {
+            return -1;
+        }
+
+        return Number(raw);
     }
 
-    function getDeepSeekThinkingStatus(title) {
-        const text =
-            (
-                title?.textContent ||
-                ''
-            ).trim();
+    function getDeepSeekRouteKey() {
+        return location.pathname + location.search;
+    }
+
+    function collectDeepSeekItems(
+        root = document
+    ) {
+        const result = [];
 
         if (
-            /^(?:思考中|正在思考|thinking)/i.test(
-                text
+            root instanceof Element &&
+            root.matches(
+                '[data-virtual-list-item-key]'
             )
         ) {
-            return 'active';
+            result.push(root);
         }
 
+        if (root.querySelectorAll) {
+            result.push(
+                ...root.querySelectorAll(
+                    '[data-virtual-list-item-key]'
+                )
+            );
+        }
+
+        return result;
+    }
+
+    function absorbDeepSeekBaseline(
+        root = document
+    ) {
+        for (
+            const item of collectDeepSeekItems(
+                root
+            )
+        ) {
+            const key =
+                getDeepSeekItemKey(item);
+
+            if (key >= 0) {
+                deepSeekThinkingBaselineKey =
+                    Math.max(
+                        deepSeekThinkingBaselineKey,
+                        key
+                    );
+            }
+        }
+    }
+
+    function primeDeepSeekThinkingState() {
+        deepSeekThinkingRoute =
+            getDeepSeekRouteKey();
+        deepSeekThinkingReady = false;
+        deepSeekThinkingBaselineKey = -1;
+        deepSeekThinkingEligibleKeys.clear();
+        deepSeekThinkingCollapsedKeys.clear();
+
+        if (deepSeekThinkingPrimeTimer) {
+            clearTimeout(
+                deepSeekThinkingPrimeTimer
+            );
+        }
+
+        absorbDeepSeekBaseline(document);
+
+        /*
+         * DeepSeek 打开/刷新旧对话时会分批挂载当前底部的虚拟列表。
+         * 在短暂稳定期内只吸收现有 key，绝不点击任何思考区域。
+         */
+        deepSeekThinkingPrimeTimer =
+            window.setTimeout(() => {
+                absorbDeepSeekBaseline(
+                    document
+                );
+                deepSeekThinkingReady = true;
+            }, 1800);
+    }
+
+    function ensureDeepSeekRouteState() {
         if (
-            /^(?:已思考|thought)/i.test(
-                text
+            getDeepSeekRouteKey() !==
+            deepSeekThinkingRoute
+        ) {
+            primeDeepSeekThinkingState();
+            return false;
+        }
+
+        return deepSeekThinkingReady;
+    }
+
+    function markDeepSeekNewItems(
+        root
+    ) {
+        for (
+            const item of collectDeepSeekItems(
+                root
             )
         ) {
-            return 'finished';
+            const key =
+                getDeepSeekItemKey(item);
+
+            if (
+                key < 0 ||
+                key <= deepSeekThinkingBaselineKey
+            ) {
+                continue;
+            }
+
+            /*
+             * data-virtual-list-item-key 在当前 DeepSeek 对话中单调递增。
+             * 刷新旧对话后向上滚动只会重新挂载更小的历史 key；
+             * 只有本次页面会话中新追加的消息才会超过 baseline。
+             */
+            deepSeekThinkingEligibleKeys.add(
+                String(key)
+            );
+            deepSeekThinkingBaselineKey =
+                Math.max(
+                    deepSeekThinkingBaselineKey,
+                    key
+                );
         }
-
-        return 'unknown';
-    }
-
-    function markDeepSeekThinkingActive(identity) {
-        if (identity.key) {
-            deepSeekThinkingActiveKeys.add(
-                identity.key
-            );
-        } else if (identity.item) {
-            deepSeekThinkingActiveItems.add(
-                identity.item
-            );
-        }
-    }
-
-    function wasDeepSeekThinkingActive(identity) {
-        if (identity.key) {
-            return deepSeekThinkingActiveKeys.has(
-                identity.key
-            );
-        }
-
-        return Boolean(
-            identity.item &&
-            deepSeekThinkingActiveItems.has(
-                identity.item
-            )
-        );
-    }
-
-    function markDeepSeekThinkingCollapsed(identity) {
-        if (identity.key) {
-            deepSeekThinkingCollapsedKeys.add(
-                identity.key
-            );
-        } else if (identity.item) {
-            deepSeekThinkingCollapsedItems.add(
-                identity.item
-            );
-        }
-    }
-
-    function unmarkDeepSeekThinkingCollapsed(identity) {
-        if (identity.key) {
-            deepSeekThinkingCollapsedKeys.delete(
-                identity.key
-            );
-        } else if (identity.item) {
-            deepSeekThinkingCollapsedItems.delete(
-                identity.item
-            );
-        }
-    }
-
-    function wasDeepSeekThinkingCollapsed(identity) {
-        if (identity.key) {
-            return deepSeekThinkingCollapsedKeys.has(
-                identity.key
-            );
-        }
-
-        return Boolean(
-            identity.item &&
-            deepSeekThinkingCollapsedItems.has(
-                identity.item
-            )
-        );
     }
 
     function getDeepSeekScrollContainer(element) {
-        let current =
+        const virtualItems =
             element &&
-            element.parentElement;
+            element.closest(
+                '.ds-virtual-list-items'
+            );
+
+        let current =
+            virtualItems
+                ? virtualItems.parentElement
+                : element &&
+                    element.parentElement;
 
         while (
             current &&
@@ -645,6 +680,36 @@
             !thinkContent ||
             !thinkContent.matches(
                 '.ds-think-content'
+            ) ||
+            !ensureDeepSeekRouteState()
+        ) {
+            return false;
+        }
+
+        const item =
+            thinkContent.closest(
+                '[data-virtual-list-item-key]'
+            );
+
+        const rawKey =
+            item &&
+            item.getAttribute(
+                'data-virtual-list-item-key'
+            );
+
+        if (
+            !rawKey ||
+            !deepSeekThinkingEligibleKeys.has(
+                rawKey
+            ) ||
+            deepSeekThinkingCollapsedKeys.has(
+                rawKey
+            ) ||
+            !isNearDeepSeekBottom(
+                thinkContent
+            ) ||
+            !isDeepSeekThinkingExpanded(
+                thinkContent
             )
         ) {
             return false;
@@ -657,56 +722,12 @@
 
         if (!title) return false;
 
-        const status =
-            getDeepSeekThinkingStatus(
-                title
-            );
-
-        const identity =
-            getDeepSeekThinkingIdentity(
-                thinkContent
-            );
-
         /*
-         * 只把“本次页面会话中亲眼见过正在思考状态”的消息视为
-         * 新回复。历史消息在虚拟列表中重新 mount 时通常直接是
-         * “已思考”，因此不会再被自动点击，从源头避免改变历史
-         * item 高度并触发 DeepSeek 的滚动锚点校正。
+         * 每个本次会话新增的 assistant item 最多自动点击一次。
+         * 用户之后手动重新展开时不会再次强制折回去。
          */
-        if (status === 'active') {
-            markDeepSeekThinkingActive(
-                identity
-            );
-        } else if (
-            status !== 'finished' ||
-            !wasDeepSeekThinkingActive(
-                identity
-            )
-        ) {
-            return false;
-        }
-
-        if (
-            wasDeepSeekThinkingCollapsed(
-                identity
-            ) ||
-            !isNearDeepSeekBottom(
-                thinkContent
-            ) ||
-            !isDeepSeekThinkingExpanded(
-                thinkContent
-            )
-        ) {
-            return false;
-        }
-
-        /*
-         * 用户正在浏览历史记录时不会执行折叠。只有接近当前聊天
-         * 底部时才允许触发原生折叠，因此延迟重试也不会把用户从
-         * 上方历史位置拉回到底部。
-         */
-        markDeepSeekThinkingCollapsed(
-            identity
+        deepSeekThinkingCollapsedKeys.add(
+            rawKey
         );
 
         title.dispatchEvent(
@@ -719,23 +740,6 @@
                 }
             )
         );
-
-        /*
-         * 如果 DeepSeek 在这一帧还没挂好折叠处理器，则撤销标记，
-         * 让后续的有限次延迟尝试能够重试。
-         */
-        requestAnimationFrame(() => {
-            if (
-                thinkContent.isConnected &&
-                isDeepSeekThinkingExpanded(
-                    thinkContent
-                )
-            ) {
-                unmarkDeepSeekThinkingCollapsed(
-                    identity
-                );
-            }
-        });
 
         return true;
     }
@@ -754,9 +758,7 @@
             candidates.push(root);
         }
 
-        if (
-            root.querySelectorAll
-        ) {
+        if (root.querySelectorAll) {
             candidates.push(
                 ...root.querySelectorAll(
                     '.ds-think-content'
@@ -802,29 +804,64 @@
 
     function installDeepSeekThinkingAutoCollapse() {
         const start = () => {
-            /*
-             * 初始扫描是安全的：已经完成的历史思考不会被折叠；
-             * 只有当前仍处于“思考中”的新回复会被登记并处理。
-             */
-            scanDeepSeekThinking(
-                document
-            );
+            primeDeepSeekThinkingState();
 
             const observer =
                 new MutationObserver(
                     records => {
+                        if (
+                            getDeepSeekRouteKey() !==
+                            deepSeekThinkingRoute
+                        ) {
+                            primeDeepSeekThinkingState();
+                            return;
+                        }
+
                         for (
                             const record of records
                         ) {
+                            if (
+                                record.type === 'attributes' &&
+                                record.target instanceof Element
+                            ) {
+                                if (
+                                    deepSeekThinkingReady
+                                ) {
+                                    markDeepSeekNewItems(
+                                        record.target
+                                    );
+                                    scanDeepSeekThinking(
+                                        record.target
+                                    );
+                                } else {
+                                    absorbDeepSeekBaseline(
+                                        record.target
+                                    );
+                                }
+                                continue;
+                            }
+
                             for (
                                 const node of
                                 record.addedNodes
                             ) {
                                 if (
-                                    node instanceof
-                                    Element
+                                    !(node instanceof Element)
                                 ) {
+                                    continue;
+                                }
+
+                                if (
+                                    deepSeekThinkingReady
+                                ) {
+                                    markDeepSeekNewItems(
+                                        node
+                                    );
                                     scanDeepSeekThinking(
+                                        node
+                                    );
+                                } else {
+                                    absorbDeepSeekBaseline(
                                         node
                                     );
                                 }
@@ -837,7 +874,11 @@
                 document.body,
                 {
                     childList: true,
-                    subtree: true
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: [
+                        'data-virtual-list-item-key'
+                    ]
                 }
             );
         };
@@ -1343,15 +1384,6 @@
                 return true;
             }
 
-            /*
-             * 2026-09 DeepSeek 当前回复操作栏：
-             *   <div role="button" class="ds-button ...">
-             *     <svg width="16" height="16" viewBox="0 0 16 16">
-             *       <path d="M6.14929 4.02032 ...">
-             *
-             * 该复制图标没有 aria-label / title / data-testid，
-             * 因此使用 SVG path 前缀作为稳定的最后回退。
-             */
             const copyIconPath = Array.from(
                 button.querySelectorAll(
                     'svg[viewBox="0 0 16 16"] path[d]'
@@ -1603,10 +1635,6 @@
         return text.slice(0, range.index) + replacement + text.slice(range.index + range.length);
     }
 
-    /**
-     * 在复制文本中定位一个已知公式，优先吞掉其外侧的定界符。
-     * ChatGPT 会将 \(...\) 与 \[...\] 中的反斜杠丢失，分别变为 (...) 与 [...].
-     */
     function findLiteralFormula(text, start, latex, display) {
         if (!latex) return null;
 
@@ -1622,7 +1650,6 @@
                 firstLiteralRange = { index, length: latex.length };
             }
 
-            // 允许公式与定界符之间存在水平空格。
             let left = index;
             let right = contentEnd;
             while (left > start && /[ \t]/.test(text[left - 1])) left -= 1;
@@ -1637,7 +1664,6 @@
                     text.slice(right, right + 2) === '\\]') {
                     return { index: left - 2, length: right + 2 - (left - 2) };
                 }
-                // ChatGPT 将 \[formula\] 复制为 [formula]。
                 if (left > start && text[left - 1] === '[' && text[right] === ']') {
                     return { index: left - 1, length: right + 1 - (left - 1) };
                 }
@@ -1647,24 +1673,20 @@
                     return { index: left - 2, length: right + 2 - (left - 2) };
                 }
                 if (left > start && text[left - 1] === '$' && text[right] === '$') {
-                    // 不将 $$...$$ 误判为行内公式。
                     const isDoubleDollar = (left >= 2 && text[left - 2] === '$') ||
                         text[right + 1] === '$';
                     if (!isDoubleDollar) {
                         return { index: left - 1, length: right + 1 - (left - 1) };
                     }
                 }
-                // ChatGPT 将 \(formula\) 复制为 (formula)。
                 if (left > start && text[left - 1] === '(' && text[right] === ')') {
                     return { index: left - 1, length: right + 1 - (left - 1) };
                 }
             }
 
-            // 当前同源码出现位置没有完整定界符，继续寻找下一处。
             searchFrom = index + Math.max(latex.length, 1);
         }
 
-        // 全部尝试失败后，才回退到仅替换公式正文。
         return firstLiteralRange;
     }
 
@@ -1676,12 +1698,6 @@
             .trim();
     }
 
-    /**
-     * 修复官方“复制回复”生成的公式文本。
-     *
-     * 行间公式必须优先匹配完整的外层公式块，不能先替换块内正文，
-     * 否则会遗留方括号。
-     */
     function repairCopiedReply(text, formulas) {
         if (typeof text !== 'string' || formulas.length === 0) {
             return text;
@@ -1691,21 +1707,18 @@
         let cursor = 0;
 
         for (const formula of formulas) {
-            // 回复内公式块保留原有段落边界，不额外添加首尾换行。
             const replacement = formula.display
                 ? `$$\n${formula.latex}\n$$`
                 : `$${formula.latex}$`;
             let range = null;
 
             if (formula.display) {
-                // ChatGPT 当前复制结果：[\n ... \n]，必须整体优先替换。
                 range = findRegexAfter(
                     repaired,
                     cursor,
                     /^[ \t]*\[[ \t]*\n[\s\S]*?\n[ \t]*\][ \t]*$/gm
                 );
 
-                // 标准 \[ ... \] 行间公式。
                 if (!range) {
                     range = findRegexAfter(
                         repaired,
@@ -1714,17 +1727,14 @@
                     );
                 }
 
-                // 已经采用 $$ ... $$ 包裹的公式。
                 if (!range) {
                     range = findRegexAfter(repaired, cursor, /\$\$[\s\S]*?\$\$/g);
                 }
 
-                // 仅当完整公式块均不存在时，才回退为原始 TeX 匹配。
                 if (!range) {
                     range = findLiteralFormula(repaired, cursor, formula.latex, true);
                 }
             } else {
-                // 行内公式：原始 TeX、可见文本、简化 TeX、官方括号格式。
                 range = findLiteralFormula(repaired, cursor, formula.latex, false);
 
                 if (!range && formula.visibleText) {
@@ -1907,9 +1917,7 @@
                                 false
                             );
                         })
-                        .catch(() => {
-                            // Native site error handling remains authoritative.
-                        });
+                        .catch(() => {});
 
                     return result;
                 }
@@ -2116,17 +2124,6 @@
             return;
         }
 
-        /*
-         * 不再读取剪贴板。
-         *
-         * 优先在当前页面上下文挂接 clipboard.writeText：
-         * 网站仍执行原生复制，我们只在写入前用 DOM 中的真实
-         * LaTeX 源码修复文本。这样保留网站自己的 Markdown/
-         * 段落格式，同时不会触发浏览器“读取剪贴板”权限提示。
-         *
-         * 若站点不用 writeText（或浏览器禁止挂接），450 ms 后
-         * 使用当前回复 DOM 直接构造纯文本并覆盖写入。
-         */
         pendingReplyCopy =
             context;
 
