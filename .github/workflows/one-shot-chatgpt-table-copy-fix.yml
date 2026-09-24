@@ -1,0 +1,345 @@
+name: One-shot ChatGPT table copy fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/one-shot-chatgpt-table-copy-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch LaTeX userscript
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('chatgpt-latex-copy-enhancer.user.js')
+          s = p.read_text(encoding='utf-8')
+
+          s = s.replace('// @version      3.3.1', '// @version      3.4.0', 1)
+
+          marker = '    function getAssistantReplyRoot(button) {'
+          if marker not in s:
+              raise SystemExit('getAssistantReplyRoot marker not found')
+
+          helper = r'''    function normalizeMarkdownTableCell(cell) {
+        return (
+            cell.innerText ||
+            cell.textContent ||
+            ''
+        )
+            .replace(/\r\n?/g, '\n')
+            .replace(/\n+/g, '<br>')
+            .replace(/\|/g, '\\|')
+            .trim();
+    }
+
+    function serializeMarkdownTableElement(table) {
+        if (!table) return '';
+
+        const clone =
+            table.cloneNode(true);
+
+        replaceFormulasInCopyRoot(clone);
+
+        const rows =
+            Array.from(
+                clone.querySelectorAll('tr')
+            )
+                .map(row =>
+                    Array.from(row.children)
+                        .filter(cell =>
+                            cell.matches('th, td')
+                        )
+                        .map(normalizeMarkdownTableCell)
+                )
+                .filter(row => row.length);
+
+        if (!rows.length) return '';
+
+        const columnCount =
+            Math.max(
+                ...rows.map(row => row.length)
+            );
+
+        const normalizedRows =
+            rows.map(row => [
+                ...row,
+                ...Array(
+                    Math.max(
+                        0,
+                        columnCount - row.length
+                    )
+                ).fill('')
+            ]);
+
+        const toLine = row =>
+            `| ${row.join(' | ')} |`;
+
+        return [
+            toLine(normalizedRows[0]),
+            toLine(
+                Array(columnCount).fill('---')
+            ),
+            ...normalizedRows
+                .slice(1)
+                .map(toLine)
+        ].join('\n');
+    }
+
+    function replaceTablesWithMarkdown(root) {
+        if (!root) return 0;
+
+        let count = 0;
+
+        for (
+            const table of Array.from(
+                root.querySelectorAll('table')
+            )
+        ) {
+            const markdown =
+                serializeMarkdownTableElement(
+                    table
+                );
+
+            if (!markdown) continue;
+
+            const replacement =
+                document.createElement('pre');
+
+            replacement.setAttribute(
+                'data-ai-markdown-table',
+                'true'
+            );
+            replacement.textContent =
+                markdown;
+
+            table.replaceWith(
+                replacement
+            );
+            count += 1;
+        }
+
+        return count;
+    }
+
+    function findChatGPTTableCopyContext(button) {
+        if (
+            ACTIVE_ADAPTER.id !== 'chatgpt' ||
+            !button ||
+            button.closest('.turn-action-controls') ||
+            isCodeCopyButton(button)
+        ) {
+            return null;
+        }
+
+        const semanticText = [
+            button.getAttribute('aria-label'),
+            button.getAttribute('title'),
+            button.getAttribute('data-testid'),
+            button.textContent
+        ]
+            .filter(value =>
+                typeof value === 'string'
+            )
+            .join(' ')
+            .toLowerCase();
+
+        if (
+            !semanticText.includes('copy') &&
+            !semanticText.includes('复制')
+        ) {
+            return null;
+        }
+
+        let current =
+            button.parentElement;
+
+        for (
+            let depth = 0;
+            current && depth < 7;
+            depth += 1,
+            current = current.parentElement
+        ) {
+            const table =
+                current.querySelector('table');
+
+            if (table) {
+                return {
+                    button,
+                    table
+                };
+            }
+
+            if (
+                current.matches(
+                    '[data-markdown-text-style="assistant-message"]'
+                )
+            ) {
+                break;
+            }
+        }
+
+        return null;
+    }
+
+    function handleChatGPTTableCopy(event) {
+        if (ACTIVE_ADAPTER.id !== 'chatgpt') {
+            return;
+        }
+
+        const target =
+            elementFromNode(
+                event.target
+            );
+
+        const button =
+            target &&
+            target.closest('button');
+
+        const context =
+            findChatGPTTableCopyContext(
+                button
+            );
+
+        if (!context) return;
+
+        const markdown =
+            serializeMarkdownTableElement(
+                context.table
+            );
+
+        if (!markdown) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+
+        const formulaCount =
+            collectFormulas(
+                context.table
+            ).length;
+
+        copyText(markdown).then(copied => {
+            showToast(
+                copied
+                    ? `已复制 Markdown 表格${formulaCount ? `，并格式化 ${formulaCount} 个公式` : ''}`
+                    : '复制 Markdown 表格失败',
+                !copied
+            );
+        });
+    }
+
+'''
+          s = s.replace(marker, helper + marker, 1)
+
+          old_return = '''        return {
+            adapterId: ACTIVE_ADAPTER.id,
+            replyRoot,
+            contentRoot,
+            formulas,
+            expiresAt: Date.now() + 1500
+        };'''
+          new_return = '''        return {
+            adapterId: ACTIVE_ADAPTER.id,
+            replyRoot,
+            contentRoot,
+            formulas,
+            hasTables:
+                ACTIVE_ADAPTER.id === 'chatgpt' &&
+                Boolean(
+                    contentRoot.querySelector('table')
+                ),
+            expiresAt: Date.now() + 1500
+        };'''
+          if old_return not in s:
+              raise SystemExit('copy context return block not found')
+          s = s.replace(old_return, new_return, 1)
+
+          old_transform = '''        let repaired = repairCopiedReply(
+            text,
+            context.formulas
+        );'''
+          new_transform = '''        if (
+            context.adapterId === 'chatgpt' &&
+            context.hasTables
+        ) {
+            const domMarkdown =
+                buildReplyTextFromDom(
+                    context
+                );
+
+            if (domMarkdown) {
+                return domMarkdown;
+            }
+        }
+
+        let repaired = repairCopiedReply(
+            text,
+            context.formulas
+        );'''
+          if old_transform not in s:
+              raise SystemExit('transform block not found')
+          s = s.replace(old_transform, new_transform, 1)
+
+          old_clone = '''        const clone =
+            context.contentRoot.cloneNode(true);
+
+        replaceFormulasInCopyRoot(clone);'''
+          new_clone = '''        const clone =
+            context.contentRoot.cloneNode(true);
+
+        /*
+         * 表格必须在全局公式替换之前转换，否则公式节点已经变成文本，
+         * 无法再按 Markdown 单元格结构输出。
+         */
+        replaceTablesWithMarkdown(clone);
+        replaceFormulasInCopyRoot(clone);'''
+          if old_clone not in s:
+              raise SystemExit('buildReplyTextFromDom clone block not found')
+          s = s.replace(old_clone, new_clone, 1)
+
+          old_listener = "    document.addEventListener('click', copySingleFormula, true);\n    document.addEventListener('click', handleReplyCopy, true);"
+          new_listener = "    document.addEventListener('click', copySingleFormula, true);\n    document.addEventListener('click', handleChatGPTTableCopy, true);\n    document.addEventListener('click', handleReplyCopy, true);"
+          if old_listener not in s:
+              raise SystemExit('click listener block not found')
+          s = s.replace(old_listener, new_listener, 1)
+
+          p.write_text(s, encoding='utf-8')
+
+          rp = Path('README.md')
+          r = rp.read_text(encoding='utf-8')
+          needle = '  - 回复级“复制”按钮修复\n'
+          addition = (
+              needle +
+              '  - v3.4.0 起保留回复中 Markdown 表格结构；表格右上角复制按钮也会将公式统一为 `$...$` / `$$...$$`\n'
+          )
+          if needle in r and 'v3.4.0 起保留回复中 Markdown 表格结构' not in r:
+              r = r.replace(needle, addition, 1)
+          rp.write_text(r, encoding='utf-8')
+          PY
+
+      - name: Validate JavaScript
+        shell: bash
+        run: |
+          node --check chatgpt-latex-copy-enhancer.user.js
+
+      - name: Commit result
+        shell: bash
+        run: |
+          rm -f .github/workflows/one-shot-chatgpt-table-copy-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Preserve Markdown tables in ChatGPT copy"
+          git push origin HEAD:main
