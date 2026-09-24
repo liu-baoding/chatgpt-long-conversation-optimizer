@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.4.1
+// @version      3.4.2
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -771,21 +771,9 @@
         if (
             ACTIVE_ADAPTER.id !== 'chatgpt' ||
             !button ||
-            isCodeCopyButton(button)
+            isCodeCopyButton(button) ||
+            isReplyCopyButton(button)
         ) {
-            return null;
-        }
-
-        /*
-         * 表格复制按钮必须位于 assistant Markdown 正文内部。
-         * 回复底部 action bar 在正文外，因此绝不会被本逻辑接管。
-         */
-        const markdownRoot =
-            button.closest(
-                '[data-markdown-text-style="assistant-message"]'
-            );
-
-        if (!markdownRoot) {
             return null;
         }
 
@@ -808,12 +796,20 @@
             return null;
         }
 
+        const turn =
+            button.closest('[data-turn-key]') ||
+            button.closest(
+                '[data-content-search-unit-key]'
+            );
+
+        if (!turn) return null;
+
         let current =
             button.parentElement;
 
         while (
             current &&
-            current !== markdownRoot
+            current !== turn
         ) {
             const tables =
                 Array.from(
@@ -829,6 +825,69 @@
 
             current =
                 current.parentElement;
+        }
+
+        const tables =
+            Array.from(
+                turn.querySelectorAll('table')
+            );
+
+        if (tables.length === 1) {
+            return {
+                button,
+                table: tables[0]
+            };
+        }
+
+        if (tables.length > 1) {
+            const buttonRect =
+                button.getBoundingClientRect();
+            const buttonY =
+                buttonRect.top +
+                buttonRect.height / 2;
+
+            const table =
+                tables
+                    .map(table => {
+                        const rect =
+                            table.getBoundingClientRect();
+                        const topDistance =
+                            Math.abs(
+                                buttonY - rect.top
+                            );
+                        const centerDistance =
+                            Math.abs(
+                                buttonY -
+                                (
+                                    rect.top +
+                                    rect.height / 2
+                                )
+                            );
+
+                        return {
+                            table,
+                            distance:
+                                Math.min(
+                                    topDistance,
+                                    centerDistance
+                                )
+                        };
+                    })
+                    .sort(
+                        (a, b) =>
+                            a.distance -
+                            b.distance
+                    )[0];
+
+            if (
+                table &&
+                table.distance <= 180
+            ) {
+                return {
+                    button,
+                    table: table.table
+                };
+            }
         }
 
         return null;
@@ -855,30 +914,30 @@
 
         if (!context) return;
 
-        const markdown =
-            serializeMarkdownTableElement(
-                context.table
-            );
-
-        if (!markdown) return;
-
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-
-        const formulaCount =
+        const formulas =
             collectFormulas(
                 context.table
-            ).length;
-
-        copyText(markdown).then(copied => {
-            showToast(
-                copied
-                    ? `已复制 Markdown 表格${formulaCount ? `，并格式化 ${formulaCount} 个公式` : ''}`
-                    : '复制 Markdown 表格失败',
-                !copied
             );
-        });
+
+        if (!formulas.length) {
+            return;
+        }
+
+        /*
+         * Let ChatGPT perform its native Markdown copy. We only remember
+         * which table is being copied and normalize formula delimiters when
+         * the site actually writes text to the clipboard.
+         */
+        pendingReplyCopy = {
+            adapterId: 'chatgpt',
+            replyRoot: context.table,
+            contentRoot: context.table,
+            formulas,
+            tables: [],
+            expiresAt: Date.now() + 1500
+        };
+
+        installClipboardWriteInterceptor();
     }
 
     function getAssistantReplyRoot(button) {
@@ -1602,26 +1661,21 @@
             return text;
         }
 
+        if (context.adapterId === 'chatgpt') {
+            /*
+             * ChatGPT already preserves Markdown tables, paragraphs, lists,
+             * emphasis, etc. Keep that native structure untouched and only
+             * normalize math delimiters.
+             */
+            return normalizeCopiedDelimiters(
+                text
+            );
+        }
+
         let repaired = repairCopiedReply(
             text,
             context.formulas
         );
-
-        if (
-            context.adapterId === 'chatgpt' &&
-            context.tables &&
-            context.tables.length
-        ) {
-            /*
-             * 保留 ChatGPT 原生整条回复复制出的 Markdown，只把其中
-             * 被拍平为 TSV 的表格片段替换回 Markdown 表格。
-             */
-            repaired =
-                repairMarkdownTablesInCopiedText(
-                    repaired,
-                    context.tables
-                );
-        }
 
         if (context.adapterId === 'deepseek') {
             repaired =
@@ -1640,95 +1694,240 @@
         const proto =
             Object.getPrototypeOf(clipboard);
 
-        if (
-            !proto ||
-            typeof proto.writeText !== 'function'
-        ) {
-            return false;
-        }
+        if (!proto) return false;
 
-        const originalWriteText =
-            proto.writeText;
+        let installed = false;
 
         if (
-            originalWriteText
-                .__aiLatexWriteInterceptor
+            typeof proto.writeText === 'function' &&
+            !proto.writeText.__aiLatexWriteTextInterceptor
         ) {
-            clipboardWriteInterceptorInstalled =
-                true;
-            return true;
+            const originalWriteText =
+                proto.writeText;
+
+            const wrappedWriteText =
+                function (text) {
+                    const context =
+                        pendingReplyCopy;
+
+                    if (
+                        context &&
+                        Date.now() <=
+                            context.expiresAt &&
+                        typeof text === 'string'
+                    ) {
+                        pendingReplyCopy = null;
+
+                        const repaired =
+                            transformNativeReplyText(
+                                text,
+                                context
+                            );
+
+                        const result =
+                            originalWriteText.call(
+                                this,
+                                repaired
+                            );
+
+                        Promise.resolve(result)
+                            .then(() => {
+                                showToast(
+                                    `已格式化复制内容中的 ${context.formulas.length} 个公式`,
+                                    false
+                                );
+                            })
+                            .catch(() => {});
+
+                        return result;
+                    }
+
+                    return originalWriteText.call(
+                        this,
+                        text
+                    );
+                };
+
+            Object.defineProperty(
+                wrappedWriteText,
+                '__aiLatexWriteTextInterceptor',
+                { value: true }
+            );
+
+            try {
+                Object.defineProperty(
+                    proto,
+                    'writeText',
+                    {
+                        configurable: true,
+                        writable: true,
+                        value: wrappedWriteText
+                    }
+                );
+                installed = true;
+            } catch (error) {
+                console.debug(
+                    '[AI LaTeX] cannot hook clipboard.writeText:',
+                    error
+                );
+            }
+        } else if (
+            typeof proto.writeText === 'function'
+        ) {
+            installed = true;
         }
 
-        const wrappedWriteText =
-            function (text) {
-                const context =
-                    pendingReplyCopy;
+        if (
+            typeof proto.write === 'function' &&
+            !proto.write.__aiLatexWriteInterceptor
+        ) {
+            const originalWrite =
+                proto.write;
 
-                if (
-                    context &&
-                    Date.now() <=
-                        context.expiresAt &&
-                    typeof text === 'string'
-                ) {
-                    pendingReplyCopy = null;
+            const wrappedWrite =
+                async function (items) {
+                    const context =
+                        pendingReplyCopy;
 
-                    const repaired =
-                        transformNativeReplyText(
-                            text,
-                            context
+                    if (
+                        !context ||
+                        Date.now() >
+                            context.expiresAt ||
+                        !Array.isArray(items)
+                    ) {
+                        return originalWrite.call(
+                            this,
+                            items
+                        );
+                    }
+
+                    let transformedPlainText =
+                        false;
+
+                    const transformedItems =
+                        await Promise.all(
+                            items.map(
+                                async item => {
+                                    if (
+                                        !item ||
+                                        !Array.isArray(item.types)
+                                    ) {
+                                        return item;
+                                    }
+
+                                    const payload = {};
+
+                                    for (
+                                        const type of item.types
+                                    ) {
+                                        const blob =
+                                            await item.getType(
+                                                type
+                                            );
+
+                                        if (
+                                            type === 'text/plain'
+                                        ) {
+                                            const text =
+                                                await blob.text();
+                                            const repaired =
+                                                transformNativeReplyText(
+                                                    text,
+                                                    context
+                                                );
+
+                                            payload[type] =
+                                                new Blob(
+                                                    [repaired],
+                                                    {
+                                                        type:
+                                                            'text/plain'
+                                                    }
+                                                );
+                                            transformedPlainText =
+                                                true;
+                                        } else {
+                                            payload[type] =
+                                                blob;
+                                        }
+                                    }
+
+                                    try {
+                                        return new ClipboardItem(
+                                            payload,
+                                            {
+                                                presentationStyle:
+                                                    item.presentationStyle
+                                            }
+                                        );
+                                    } catch (_) {
+                                        return new ClipboardItem(
+                                            payload
+                                        );
+                                    }
+                                }
+                            )
                         );
 
+                    if (transformedPlainText) {
+                        pendingReplyCopy = null;
+                    }
+
                     const result =
-                        originalWriteText.call(
+                        originalWrite.call(
                             this,
-                            repaired
+                            transformedItems
                         );
 
                     Promise.resolve(result)
                         .then(() => {
-                            showToast(
-                                `已修复回复中的 ${context.formulas.length} 个公式`,
-                                false
-                            );
+                            if (
+                                transformedPlainText
+                            ) {
+                                showToast(
+                                    `已格式化复制内容中的 ${context.formulas.length} 个公式`,
+                                    false
+                                );
+                            }
                         })
                         .catch(() => {});
 
                     return result;
-                }
+                };
 
-                return originalWriteText.call(
-                    this,
-                    text
-                );
-            };
-
-        try {
             Object.defineProperty(
-                wrappedWriteText,
+                wrappedWrite,
                 '__aiLatexWriteInterceptor',
                 { value: true }
             );
 
-            Object.defineProperty(
-                proto,
-                'writeText',
-                {
-                    configurable: true,
-                    writable: true,
-                    value: wrappedWriteText
-                }
-            );
-
-            clipboardWriteInterceptorInstalled =
-                true;
-            return true;
-        } catch (error) {
-            console.debug(
-                '[AI LaTeX] 无法挂接 clipboard.writeText，将使用 DOM 回退复制：',
-                error
-            );
-            return false;
+            try {
+                Object.defineProperty(
+                    proto,
+                    'write',
+                    {
+                        configurable: true,
+                        writable: true,
+                        value: wrappedWrite
+                    }
+                );
+                installed = true;
+            } catch (error) {
+                console.debug(
+                    '[AI LaTeX] cannot hook clipboard.write:',
+                    error
+                );
+            }
+        } else if (
+            typeof proto.write === 'function'
+        ) {
+            installed = true;
         }
+
+        clipboardWriteInterceptorInstalled =
+            installed;
+
+        return installed;
     }
 
     function replaceFormulasInCopyRoot(root) {
