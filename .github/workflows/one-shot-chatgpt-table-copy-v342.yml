@@ -1,0 +1,550 @@
+name: One-shot ChatGPT table copy v3.4.2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/one-shot-chatgpt-table-copy-v342.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('chatgpt-latex-copy-enhancer.user.js')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('// @version      3.4.1', '// @version      3.4.2', 1)
+
+          def replace_between(text, start_marker, end_marker, replacement):
+              a = text.index(start_marker)
+              b = text.index(end_marker, a)
+              return text[:a] + replacement + text[b:]
+
+          new_table_context = r'''    function findChatGPTTableCopyContext(button) {
+        if (
+            ACTIVE_ADAPTER.id !== 'chatgpt' ||
+            !button ||
+            isCodeCopyButton(button) ||
+            isReplyCopyButton(button)
+        ) {
+            return null;
+        }
+
+        const semanticText = [
+            button.getAttribute('aria-label'),
+            button.getAttribute('title'),
+            button.getAttribute('data-testid'),
+            button.textContent
+        ]
+            .filter(value =>
+                typeof value === 'string'
+            )
+            .join(' ')
+            .toLowerCase();
+
+        if (
+            !semanticText.includes('copy') &&
+            !semanticText.includes('复制')
+        ) {
+            return null;
+        }
+
+        const turn =
+            button.closest('[data-turn-key]') ||
+            button.closest(
+                '[data-content-search-unit-key]'
+            );
+
+        if (!turn) return null;
+
+        let current =
+            button.parentElement;
+
+        while (
+            current &&
+            current !== turn
+        ) {
+            const tables =
+                Array.from(
+                    current.querySelectorAll('table')
+                );
+
+            if (tables.length === 1) {
+                return {
+                    button,
+                    table: tables[0]
+                };
+            }
+
+            current =
+                current.parentElement;
+        }
+
+        const tables =
+            Array.from(
+                turn.querySelectorAll('table')
+            );
+
+        if (tables.length === 1) {
+            return {
+                button,
+                table: tables[0]
+            };
+        }
+
+        if (tables.length > 1) {
+            const buttonRect =
+                button.getBoundingClientRect();
+            const buttonY =
+                buttonRect.top +
+                buttonRect.height / 2;
+
+            const table =
+                tables
+                    .map(table => {
+                        const rect =
+                            table.getBoundingClientRect();
+                        const topDistance =
+                            Math.abs(
+                                buttonY - rect.top
+                            );
+                        const centerDistance =
+                            Math.abs(
+                                buttonY -
+                                (
+                                    rect.top +
+                                    rect.height / 2
+                                )
+                            );
+
+                        return {
+                            table,
+                            distance:
+                                Math.min(
+                                    topDistance,
+                                    centerDistance
+                                )
+                        };
+                    })
+                    .sort(
+                        (a, b) =>
+                            a.distance -
+                            b.distance
+                    )[0];
+
+            if (
+                table &&
+                table.distance <= 180
+            ) {
+                return {
+                    button,
+                    table: table.table
+                };
+            }
+        }
+
+        return null;
+    }
+
+'''
+          s = replace_between(
+              s,
+              '    function findChatGPTTableCopyContext(button) {',
+              '    function handleChatGPTTableCopy(event) {',
+              new_table_context,
+          )
+
+          new_table_handler = r'''    function handleChatGPTTableCopy(event) {
+        if (ACTIVE_ADAPTER.id !== 'chatgpt') {
+            return;
+        }
+
+        const target =
+            elementFromNode(
+                event.target
+            );
+
+        const button =
+            target &&
+            target.closest('button');
+
+        const context =
+            findChatGPTTableCopyContext(
+                button
+            );
+
+        if (!context) return;
+
+        const formulas =
+            collectFormulas(
+                context.table
+            );
+
+        if (!formulas.length) {
+            return;
+        }
+
+        /*
+         * 不再自己复制表格。让 ChatGPT 原生按钮生成 Markdown，
+         * 我们只在真正写入剪贴板时规范化公式定界符。
+         */
+        pendingReplyCopy = {
+            adapterId: 'chatgpt',
+            replyRoot: context.table,
+            contentRoot: context.table,
+            formulas,
+            tables: [],
+            expiresAt: Date.now() + 1500
+        };
+
+        installClipboardWriteInterceptor();
+    }
+
+'''
+          s = replace_between(
+              s,
+              '    function handleChatGPTTableCopy(event) {',
+              '    function getAssistantReplyRoot(button) {',
+              new_table_handler,
+          )
+
+          new_transform = r'''    function transformNativeReplyText(text, context) {
+        if (
+            !context ||
+            typeof text !== 'string'
+        ) {
+            return text;
+        }
+
+        if (context.adapterId === 'chatgpt') {
+            /*
+             * ChatGPT 原生复制已经能正确保留 Markdown 表格、段落、
+             * 列表和粗体。这里只规范化公式定界符，不重建正文结构。
+             */
+            return normalizeCopiedDelimiters(
+                text
+            );
+        }
+
+        let repaired = repairCopiedReply(
+            text,
+            context.formulas
+        );
+
+        if (context.adapterId === 'deepseek') {
+            repaired =
+                normalizeCopiedDelimiters(
+                    repaired
+                );
+        }
+
+        return repaired;
+    }
+
+'''
+          s = replace_between(
+              s,
+              '    function transformNativeReplyText(text, context) {',
+              '    function installClipboardWriteInterceptor() {',
+              new_transform,
+          )
+
+          new_interceptor = r'''    function installClipboardWriteInterceptor() {
+        const clipboard = navigator.clipboard;
+        if (!clipboard) return false;
+
+        const proto =
+            Object.getPrototypeOf(clipboard);
+
+        if (!proto) return false;
+
+        let installed = false;
+
+        if (
+            typeof proto.writeText === 'function' &&
+            !proto.writeText.__aiLatexWriteTextInterceptor
+        ) {
+            const originalWriteText =
+                proto.writeText;
+
+            const wrappedWriteText =
+                function (text) {
+                    const context =
+                        pendingReplyCopy;
+
+                    if (
+                        context &&
+                        Date.now() <=
+                            context.expiresAt &&
+                        typeof text === 'string'
+                    ) {
+                        pendingReplyCopy = null;
+
+                        const repaired =
+                            transformNativeReplyText(
+                                text,
+                                context
+                            );
+
+                        const result =
+                            originalWriteText.call(
+                                this,
+                                repaired
+                            );
+
+                        Promise.resolve(result)
+                            .then(() => {
+                                showToast(
+                                    `已格式化复制内容中的 ${context.formulas.length} 个公式`,
+                                    false
+                                );
+                            })
+                            .catch(() => {});
+
+                        return result;
+                    }
+
+                    return originalWriteText.call(
+                        this,
+                        text
+                    );
+                };
+
+            Object.defineProperty(
+                wrappedWriteText,
+                '__aiLatexWriteTextInterceptor',
+                { value: true }
+            );
+
+            try {
+                Object.defineProperty(
+                    proto,
+                    'writeText',
+                    {
+                        configurable: true,
+                        writable: true,
+                        value: wrappedWriteText
+                    }
+                );
+                installed = true;
+            } catch (error) {
+                console.debug(
+                    '[AI LaTeX] 无法挂接 clipboard.writeText：',
+                    error
+                );
+            }
+        } else if (
+            typeof proto.writeText === 'function'
+        ) {
+            installed = true;
+        }
+
+        if (
+            typeof proto.write === 'function' &&
+            !proto.write.__aiLatexWriteInterceptor
+        ) {
+            const originalWrite =
+                proto.write;
+
+            const wrappedWrite =
+                async function (items) {
+                    const context =
+                        pendingReplyCopy;
+
+                    if (
+                        !context ||
+                        Date.now() >
+                            context.expiresAt ||
+                        !Array.isArray(items)
+                    ) {
+                        return originalWrite.call(
+                            this,
+                            items
+                        );
+                    }
+
+                    let transformedPlainText =
+                        false;
+
+                    const transformedItems =
+                        await Promise.all(
+                            items.map(
+                                async item => {
+                                    if (
+                                        !item ||
+                                        !Array.isArray(item.types)
+                                    ) {
+                                        return item;
+                                    }
+
+                                    const payload = {};
+
+                                    for (
+                                        const type of item.types
+                                    ) {
+                                        const blob =
+                                            await item.getType(
+                                                type
+                                            );
+
+                                        if (
+                                            type === 'text/plain'
+                                        ) {
+                                            const text =
+                                                await blob.text();
+                                            const repaired =
+                                                transformNativeReplyText(
+                                                    text,
+                                                    context
+                                                );
+
+                                            payload[type] =
+                                                new Blob(
+                                                    [repaired],
+                                                    {
+                                                        type:
+                                                            'text/plain'
+                                                    }
+                                                );
+                                            transformedPlainText =
+                                                true;
+                                        } else {
+                                            payload[type] =
+                                                blob;
+                                        }
+                                    }
+
+                                    try {
+                                        return new ClipboardItem(
+                                            payload,
+                                            {
+                                                presentationStyle:
+                                                    item.presentationStyle
+                                            }
+                                        );
+                                    } catch (_) {
+                                        return new ClipboardItem(
+                                            payload
+                                        );
+                                    }
+                                }
+                            )
+                        );
+
+                    if (transformedPlainText) {
+                        pendingReplyCopy = null;
+                    }
+
+                    const result =
+                        originalWrite.call(
+                            this,
+                            transformedItems
+                        );
+
+                    Promise.resolve(result)
+                        .then(() => {
+                            if (
+                                transformedPlainText
+                            ) {
+                                showToast(
+                                    `已格式化复制内容中的 ${context.formulas.length} 个公式`,
+                                    false
+                                );
+                            }
+                        })
+                        .catch(() => {});
+
+                    return result;
+                };
+
+            Object.defineProperty(
+                wrappedWrite,
+                '__aiLatexWriteInterceptor',
+                { value: true }
+            );
+
+            try {
+                Object.defineProperty(
+                    proto,
+                    'write',
+                    {
+                        configurable: true,
+                        writable: true,
+                        value: wrappedWrite
+                    }
+                );
+                installed = true;
+            } catch (error) {
+                console.debug(
+                    '[AI LaTeX] 无法挂接 clipboard.write：',
+                    error
+                );
+            }
+        } else if (
+            typeof proto.write === 'function'
+        ) {
+            installed = true;
+        }
+
+        clipboardWriteInterceptorInstalled =
+            installed;
+
+        return installed;
+    }
+
+'''
+          s = replace_between(
+              s,
+              '    function installClipboardWriteInterceptor() {',
+              '    function replaceFormulasInCopyRoot(root) {',
+              new_interceptor,
+          )
+
+          # Use native ChatGPT copy only; no DOM fallback overwrite.
+          old = '''            if (
+                context.adapterId === 'chatgpt'
+            ) {
+                return;
+            }
+'''
+          if old not in s:
+              raise SystemExit('ChatGPT fallback guard missing')
+
+          p.write_text(s, encoding='utf-8')
+
+          rp = Path('README.md')
+          r = rp.read_text(encoding='utf-8')
+          r = r.replace(
+              '  - v3.4.0 起保留回复中的 Markdown 表格结构；表格右上角复制按钮也会将公式统一为 `$...$` / `$$...$$`\n',
+              '  - v3.4.2 起完全保留 ChatGPT 原生复制出的 Markdown 结构；回复级复制和表格右上角复制均只在写入剪贴板时将 `\\(...\\)` / `\\[...\\]` 规范化为 `$...$` / `$$...$$`\n',
+              1,
+          )
+          rp.write_text(r, encoding='utf-8')
+          PY
+
+      - name: Validate JavaScript
+        shell: bash
+        run: |
+          node --check chatgpt-latex-copy-enhancer.user.js
+
+      - name: Commit result
+        shell: bash
+        run: |
+          rm -f .github/workflows/one-shot-chatgpt-table-copy-v342.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix ChatGPT native copy interception for tables and LaTeX"
+          git push origin HEAD:main
