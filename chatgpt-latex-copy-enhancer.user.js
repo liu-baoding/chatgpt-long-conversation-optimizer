@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.3.1
+// @version      3.4.0
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -666,6 +666,214 @@
         showToast(copied ? '已复制 LaTeX 公式' : '复制 LaTeX 公式失败', !copied);
     }
 
+    function normalizeMarkdownTableCell(cell) {
+        return (
+            cell.innerText ||
+            cell.textContent ||
+            ''
+        )
+            .replace(/\r\n?/g, '\n')
+            .replace(/\n+/g, '<br>')
+            .replace(/\|/g, '\\|')
+            .trim();
+    }
+
+    function serializeMarkdownTableElement(table) {
+        if (!table) return '';
+
+        const clone =
+            table.cloneNode(true);
+
+        replaceFormulasInCopyRoot(clone);
+
+        const rows =
+            Array.from(
+                clone.querySelectorAll('tr')
+            )
+                .map(row =>
+                    Array.from(row.children)
+                        .filter(cell =>
+                            cell.matches('th, td')
+                        )
+                        .map(normalizeMarkdownTableCell)
+                )
+                .filter(row => row.length);
+
+        if (!rows.length) return '';
+
+        const columnCount =
+            Math.max(
+                ...rows.map(row => row.length)
+            );
+
+        const normalizedRows =
+            rows.map(row => [
+                ...row,
+                ...Array(
+                    Math.max(
+                        0,
+                        columnCount - row.length
+                    )
+                ).fill('')
+            ]);
+
+        const toLine = row =>
+            `| ${row.join(' | ')} |`;
+
+        return [
+            toLine(normalizedRows[0]),
+            toLine(
+                Array(columnCount).fill('---')
+            ),
+            ...normalizedRows
+                .slice(1)
+                .map(toLine)
+        ].join('\n');
+    }
+
+    function replaceTablesWithMarkdown(root) {
+        if (!root) return 0;
+
+        let count = 0;
+
+        for (
+            const table of Array.from(
+                root.querySelectorAll('table')
+            )
+        ) {
+            const markdown =
+                serializeMarkdownTableElement(
+                    table
+                );
+
+            if (!markdown) continue;
+
+            const replacement =
+                document.createElement('pre');
+
+            replacement.setAttribute(
+                'data-ai-markdown-table',
+                'true'
+            );
+            replacement.textContent =
+                markdown;
+
+            table.replaceWith(
+                replacement
+            );
+            count += 1;
+        }
+
+        return count;
+    }
+
+    function findChatGPTTableCopyContext(button) {
+        if (
+            ACTIVE_ADAPTER.id !== 'chatgpt' ||
+            !button ||
+            button.closest('.turn-action-controls') ||
+            isCodeCopyButton(button)
+        ) {
+            return null;
+        }
+
+        const semanticText = [
+            button.getAttribute('aria-label'),
+            button.getAttribute('title'),
+            button.getAttribute('data-testid'),
+            button.textContent
+        ]
+            .filter(value =>
+                typeof value === 'string'
+            )
+            .join(' ')
+            .toLowerCase();
+
+        if (
+            !semanticText.includes('copy') &&
+            !semanticText.includes('复制')
+        ) {
+            return null;
+        }
+
+        let current =
+            button.parentElement;
+
+        for (
+            let depth = 0;
+            current && depth < 7;
+            depth += 1,
+            current = current.parentElement
+        ) {
+            const table =
+                current.querySelector('table');
+
+            if (table) {
+                return {
+                    button,
+                    table
+                };
+            }
+
+            if (
+                current.matches(
+                    '[data-markdown-text-style="assistant-message"]'
+                )
+            ) {
+                break;
+            }
+        }
+
+        return null;
+    }
+
+    function handleChatGPTTableCopy(event) {
+        if (ACTIVE_ADAPTER.id !== 'chatgpt') {
+            return;
+        }
+
+        const target =
+            elementFromNode(
+                event.target
+            );
+
+        const button =
+            target &&
+            target.closest('button');
+
+        const context =
+            findChatGPTTableCopyContext(
+                button
+            );
+
+        if (!context) return;
+
+        const markdown =
+            serializeMarkdownTableElement(
+                context.table
+            );
+
+        if (!markdown) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+
+        const formulaCount =
+            collectFormulas(
+                context.table
+            ).length;
+
+        copyText(markdown).then(copied => {
+            showToast(
+                copied
+                    ? `已复制 Markdown 表格${formulaCount ? `，并格式化 ${formulaCount} 个公式` : ''}`
+                    : '复制 Markdown 表格失败',
+                !copied
+            );
+        });
+    }
+
     function getAssistantReplyRoot(button) {
         if (
             ACTIVE_ADAPTER.id !== 'chatgpt' ||
@@ -1308,6 +1516,11 @@
             replyRoot,
             contentRoot,
             formulas,
+            hasTables:
+                ACTIVE_ADAPTER.id === 'chatgpt' &&
+                Boolean(
+                    contentRoot.querySelector('table')
+                ),
             expiresAt: Date.now() + 1500
         };
     }
@@ -1318,6 +1531,20 @@
             typeof text !== 'string'
         ) {
             return text;
+        }
+
+        if (
+            context.adapterId === 'chatgpt' &&
+            context.hasTables
+        ) {
+            const domMarkdown =
+                buildReplyTextFromDom(
+                    context
+                );
+
+            if (domMarkdown) {
+                return domMarkdown;
+            }
         }
 
         let repaired = repairCopiedReply(
@@ -1495,6 +1722,11 @@
         const clone =
             context.contentRoot.cloneNode(true);
 
+        /*
+         * Convert tables before the remaining formulas: the table serializer
+         * still needs the KaTeX source nodes in order to emit Markdown cells.
+         */
+        replaceTablesWithMarkdown(clone);
         replaceFormulasInCopyRoot(clone);
 
         const sandbox =
@@ -1616,6 +1848,7 @@
     document.addEventListener('mouseover', handleFormulaHover, true);
     document.addEventListener('mouseout', handleFormulaLeave, true);
     document.addEventListener('click', copySingleFormula, true);
+    document.addEventListener('click', handleChatGPTTableCopy, true);
     document.addEventListener('click', handleReplyCopy, true);
     document.addEventListener('copy', handleSelectionCopy, { capture: true, passive: false });
     document.addEventListener('scroll', hidePreview, true);
