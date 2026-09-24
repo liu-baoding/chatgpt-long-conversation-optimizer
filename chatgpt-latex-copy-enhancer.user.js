@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.4.2
+// @version      3.4.3
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -796,20 +796,29 @@
             return null;
         }
 
-        const turn =
+        /*
+         * ChatGPT 当前的表格复制按钮并不一定位于
+         * data-markdown-text-style="assistant-message" 节点内部。
+         * 这里只向上寻找局部祖先中的表格；绝不回退到整个
+         * assistant turn，从结构上避免把回答底部复制按钮误判为表格复制。
+         */
+        const stopRoot =
             button.closest('[data-turn-key]') ||
             button.closest(
-                '[data-content-search-unit-key]'
+                '[data-content-search-unit-key$=":assistant"]'
+            ) ||
+            button.closest(
+                '[data-message-author-role="assistant"]'
             );
-
-        if (!turn) return null;
 
         let current =
             button.parentElement;
+        let depth = 0;
 
         while (
             current &&
-            current !== turn
+            current !== stopRoot &&
+            depth < 10
         ) {
             const tables =
                 Array.from(
@@ -823,71 +832,13 @@
                 };
             }
 
+            if (tables.length > 1) {
+                return null;
+            }
+
             current =
                 current.parentElement;
-        }
-
-        const tables =
-            Array.from(
-                turn.querySelectorAll('table')
-            );
-
-        if (tables.length === 1) {
-            return {
-                button,
-                table: tables[0]
-            };
-        }
-
-        if (tables.length > 1) {
-            const buttonRect =
-                button.getBoundingClientRect();
-            const buttonY =
-                buttonRect.top +
-                buttonRect.height / 2;
-
-            const table =
-                tables
-                    .map(table => {
-                        const rect =
-                            table.getBoundingClientRect();
-                        const topDistance =
-                            Math.abs(
-                                buttonY - rect.top
-                            );
-                        const centerDistance =
-                            Math.abs(
-                                buttonY -
-                                (
-                                    rect.top +
-                                    rect.height / 2
-                                )
-                            );
-
-                        return {
-                            table,
-                            distance:
-                                Math.min(
-                                    topDistance,
-                                    centerDistance
-                                )
-                        };
-                    })
-                    .sort(
-                        (a, b) =>
-                            a.distance -
-                            b.distance
-                    )[0];
-
-            if (
-                table &&
-                table.distance <= 180
-            ) {
-                return {
-                    button,
-                    table: table.table
-                };
-            }
+            depth += 1;
         }
 
         return null;
@@ -914,30 +865,40 @@
 
         if (!context) return;
 
-        const formulas =
-            collectFormulas(
+        const markdown =
+            serializeMarkdownTableElement(
                 context.table
             );
 
-        if (!formulas.length) {
-            return;
-        }
+        if (!markdown) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
 
         /*
-         * Let ChatGPT perform its native Markdown copy. We only remember
-         * which table is being copied and normalize formula delimiters when
-         * the site actually writes text to the clipboard.
+         * 表格按钮只复制当前表格，因此直接序列化局部 table 最稳。
+         * 回复底部复制继续走 ChatGPT 原生 Markdown + 公式定界符规范化。
          */
-        pendingReplyCopy = {
-            adapterId: 'chatgpt',
-            replyRoot: context.table,
-            contentRoot: context.table,
-            formulas,
-            tables: [],
-            expiresAt: Date.now() + 1500
-        };
+        pendingReplyCopy = null;
 
-        installClipboardWriteInterceptor();
+        const formulaCount =
+            collectFormulas(
+                context.table
+            ).length;
+
+        copyText(markdown).then(copied => {
+            const suffix = formulaCount
+                ? '，并格式化 ' + formulaCount + ' 个公式'
+                : '';
+
+            showToast(
+                copied
+                    ? '已复制 Markdown 表格' + suffix
+                    : '复制 Markdown 表格失败',
+                !copied
+            );
+        });
     }
 
     function getAssistantReplyRoot(button) {
