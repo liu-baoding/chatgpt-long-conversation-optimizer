@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI LaTeX 悬浮与复制增强
 // @namespace    http://tampermonkey.net/
-// @version      3.4.3
+// @version      3.4.4
 // @description  为 ChatGPT、Claude、DeepSeek、Gemini、AI Studio、豆包、知乎等网站增强 LaTeX 复制
 // @license      MIT
 // @author       Liu Baoding; multi-site compatibility adapted from fanxing's AI网站公式复制Latex (MIT)
@@ -767,11 +767,132 @@
         return count;
     }
 
+    function getChatGPTLocalCopyTarget(button) {
+        if (!button) return null;
+
+        const stopRoot =
+            button.closest('[data-turn-key]') ||
+            button.closest(
+                '[data-content-search-unit-key$=":assistant"]'
+            ) ||
+            button.closest(
+                '[data-message-author-role="assistant"]'
+            );
+
+        const distanceToTopRight =
+            (element, buttonRect) => {
+                const rect =
+                    element.getBoundingClientRect();
+                const buttonX =
+                    buttonRect.left +
+                    buttonRect.width / 2;
+                const buttonY =
+                    buttonRect.top +
+                    buttonRect.height / 2;
+
+                return Math.hypot(
+                    buttonX - rect.right,
+                    buttonY - rect.top
+                );
+            };
+
+        let current =
+            button.parentElement;
+        let depth = 0;
+
+        while (
+            current &&
+            current !== stopRoot &&
+            depth < 12
+        ) {
+            const tables =
+                Array.from(
+                    current.querySelectorAll('table')
+                );
+
+            const codeBlocks =
+                Array.from(
+                    current.querySelectorAll(
+                        'pre, [data-code-block]'
+                    )
+                ).filter(
+                    (element, index, array) =>
+                        array.indexOf(element) === index
+                );
+
+            if (
+                tables.length === 1 &&
+                codeBlocks.length === 0
+            ) {
+                return {
+                    kind: 'table',
+                    element: tables[0]
+                };
+            }
+
+            if (
+                codeBlocks.length > 0 &&
+                tables.length === 0
+            ) {
+                return {
+                    kind: 'code',
+                    element: codeBlocks[0]
+                };
+            }
+
+            if (
+                tables.length ||
+                codeBlocks.length
+            ) {
+                const buttonRect =
+                    button.getBoundingClientRect();
+
+                const candidates = [
+                    ...tables.map(element => ({
+                        kind: 'table',
+                        element
+                    })),
+                    ...codeBlocks.map(element => ({
+                        kind: 'code',
+                        element
+                    }))
+                ]
+                    .map(candidate => ({
+                        ...candidate,
+                        distance:
+                            distanceToTopRight(
+                                candidate.element,
+                                buttonRect
+                            )
+                    }))
+                    .sort(
+                        (a, b) =>
+                            a.distance -
+                            b.distance
+                    );
+
+                if (
+                    candidates[0] &&
+                    candidates[0].distance <= 220
+                ) {
+                    return candidates[0];
+                }
+
+                return null;
+            }
+
+            current =
+                current.parentElement;
+            depth += 1;
+        }
+
+        return null;
+    }
+
     function findChatGPTTableCopyContext(button) {
         if (
             ACTIVE_ADAPTER.id !== 'chatgpt' ||
             !button ||
-            isCodeCopyButton(button) ||
             isReplyCopyButton(button)
         ) {
             return null;
@@ -796,52 +917,22 @@
             return null;
         }
 
-        /*
-         * ChatGPT 当前的表格复制按钮并不一定位于
-         * data-markdown-text-style="assistant-message" 节点内部。
-         * 这里只向上寻找局部祖先中的表格；绝不回退到整个
-         * assistant turn，从结构上避免把回答底部复制按钮误判为表格复制。
-         */
-        const stopRoot =
-            button.closest('[data-turn-key]') ||
-            button.closest(
-                '[data-content-search-unit-key$=":assistant"]'
-            ) ||
-            button.closest(
-                '[data-message-author-role="assistant"]'
+        const target =
+            getChatGPTLocalCopyTarget(
+                button
             );
 
-        let current =
-            button.parentElement;
-        let depth = 0;
-
-        while (
-            current &&
-            current !== stopRoot &&
-            depth < 10
+        if (
+            !target ||
+            target.kind !== 'table'
         ) {
-            const tables =
-                Array.from(
-                    current.querySelectorAll('table')
-                );
-
-            if (tables.length === 1) {
-                return {
-                    button,
-                    table: tables[0]
-                };
-            }
-
-            if (tables.length > 1) {
-                return null;
-            }
-
-            current =
-                current.parentElement;
-            depth += 1;
+            return null;
         }
 
-        return null;
+        return {
+            button,
+            table: target.element
+        };
     }
 
     function handleChatGPTTableCopy(event) {
